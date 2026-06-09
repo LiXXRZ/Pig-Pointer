@@ -11,6 +11,7 @@ from collections import OrderedDict
 from ctypes import wintypes
 from pathlib import Path
 from tkinter import messagebox, ttk
+from typing import Callable
 
 try:
     import numpy as np
@@ -44,6 +45,31 @@ DIB_RGB_COLORS = 0
 WM_NCHITTEST = 0x0084
 HTTRANSPARENT = -1
 ERROR_CLASS_ALREADY_EXISTS = 1410
+WM_NULL = 0x0000
+WM_USER = 0x0400
+WM_LBUTTONUP = 0x0202
+WM_LBUTTONDBLCLK = 0x0203
+WM_RBUTTONUP = 0x0205
+WM_CONTEXTMENU = 0x007B
+WM_TRAYICON = WM_USER + 23
+NIM_ADD = 0x00000000
+NIM_DELETE = 0x00000002
+NIF_MESSAGE = 0x00000001
+NIF_ICON = 0x00000002
+NIF_TIP = 0x00000004
+IMAGE_ICON = 1
+LR_LOADFROMFILE = 0x00000010
+LR_DEFAULTSIZE = 0x00000040
+SM_CXSMICON = 49
+SM_CYSMICON = 50
+MF_STRING = 0x00000000
+MF_SEPARATOR = 0x00000800
+TPM_RIGHTBUTTON = 0x00000002
+TPM_RETURNCMD = 0x00000100
+TRAY_UID = 1
+ID_TRAY_SHOW = 1001
+ID_TRAY_TOGGLE = 1002
+ID_TRAY_EXIT = 1003
 
 
 def _enable_dpi_awareness() -> None:
@@ -75,6 +101,7 @@ def _resource_path(name: str) -> Path:
 
 LRESULT = ctypes.c_ssize_t
 HCURSOR = getattr(wintypes, "HCURSOR", wintypes.HANDLE)
+UINT_PTR = getattr(wintypes, "UINT_PTR", wintypes.WPARAM)
 WNDPROC = ctypes.WINFUNCTYPE(
     LRESULT,
     wintypes.HWND,
@@ -337,6 +364,239 @@ class AlphaOverlay:
     def update_image(self, image: Image.Image, x: int, y: int) -> None:
         bgra = GifRenderer.to_premultiplied_bgra(image)
         self.update_pixels(bgra, image.width, image.height, x, y)
+
+
+class NOTIFYICONDATAW(ctypes.Structure):
+    _fields_ = [
+        ("cbSize", wintypes.DWORD),
+        ("hWnd", wintypes.HWND),
+        ("uID", wintypes.UINT),
+        ("uFlags", wintypes.UINT),
+        ("uCallbackMessage", wintypes.UINT),
+        ("hIcon", wintypes.HICON),
+        ("szTip", ctypes.c_wchar * 128),
+    ]
+
+
+class SystemTrayIcon:
+    _api_ready = False
+    _set_window_long_ptr = None
+
+    def __init__(
+        self,
+        root: tk.Tk,
+        icon_path: Path,
+        on_show: Callable[[], None],
+        on_toggle: Callable[[], None],
+        on_exit: Callable[[], None],
+        is_running: Callable[[], bool],
+    ) -> None:
+        self.root = root
+        self.icon_path = icon_path
+        self.on_show = on_show
+        self.on_toggle = on_toggle
+        self.on_exit = on_exit
+        self.is_running = is_running
+        self.hwnd = wintypes.HWND(root.winfo_id())
+        self.hicon: int | None = None
+        self.visible = False
+        self._old_wndproc: int | None = None
+        self._wndproc_ref = WNDPROC(self._window_proc)
+
+        if sys.platform == "win32":
+            self._configure_api()
+            self._subclass_window()
+
+    @classmethod
+    def _configure_api(cls) -> None:
+        if cls._api_ready:
+            return
+
+        user32 = ctypes.windll.user32
+        shell32 = ctypes.windll.shell32
+
+        shell32.Shell_NotifyIconW.argtypes = [wintypes.DWORD, ctypes.POINTER(NOTIFYICONDATAW)]
+        shell32.Shell_NotifyIconW.restype = wintypes.BOOL
+
+        user32.LoadImageW.argtypes = [
+            wintypes.HINSTANCE,
+            wintypes.LPCWSTR,
+            wintypes.UINT,
+            ctypes.c_int,
+            ctypes.c_int,
+            wintypes.UINT,
+        ]
+        user32.LoadImageW.restype = wintypes.HANDLE
+        user32.DestroyIcon.argtypes = [wintypes.HICON]
+        user32.DestroyIcon.restype = wintypes.BOOL
+        user32.GetSystemMetrics.argtypes = [ctypes.c_int]
+        user32.GetSystemMetrics.restype = ctypes.c_int
+        user32.CallWindowProcW.argtypes = [
+            ctypes.c_void_p,
+            wintypes.HWND,
+            wintypes.UINT,
+            wintypes.WPARAM,
+            wintypes.LPARAM,
+        ]
+        user32.CallWindowProcW.restype = LRESULT
+        user32.CreatePopupMenu.argtypes = []
+        user32.CreatePopupMenu.restype = wintypes.HMENU
+        user32.AppendMenuW.argtypes = [wintypes.HMENU, wintypes.UINT, UINT_PTR, wintypes.LPCWSTR]
+        user32.AppendMenuW.restype = wintypes.BOOL
+        user32.TrackPopupMenu.argtypes = [
+            wintypes.HMENU,
+            wintypes.UINT,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            wintypes.HWND,
+            wintypes.LPVOID,
+        ]
+        user32.TrackPopupMenu.restype = wintypes.UINT
+        user32.DestroyMenu.argtypes = [wintypes.HMENU]
+        user32.DestroyMenu.restype = wintypes.BOOL
+        user32.GetCursorPos.argtypes = [ctypes.POINTER(POINT)]
+        user32.GetCursorPos.restype = wintypes.BOOL
+        user32.SetForegroundWindow.argtypes = [wintypes.HWND]
+        user32.SetForegroundWindow.restype = wintypes.BOOL
+        user32.PostMessageW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+        user32.PostMessageW.restype = wintypes.BOOL
+
+        if ctypes.sizeof(ctypes.c_void_p) == 8:
+            cls._set_window_long_ptr = user32.SetWindowLongPtrW
+        else:
+            cls._set_window_long_ptr = user32.SetWindowLongW
+        cls._set_window_long_ptr.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_void_p]
+        cls._set_window_long_ptr.restype = ctypes.c_void_p
+
+        cls._api_ready = True
+
+    def _subclass_window(self) -> None:
+        if self._old_wndproc is not None or self._set_window_long_ptr is None:
+            return
+        new_wndproc = ctypes.cast(self._wndproc_ref, ctypes.c_void_p)
+        self._old_wndproc = self._set_window_long_ptr(self.hwnd, -4, new_wndproc)
+
+    def _window_proc(
+        self,
+        hwnd: wintypes.HWND,
+        msg: wintypes.UINT,
+        wparam: wintypes.WPARAM,
+        lparam: wintypes.LPARAM,
+    ) -> int:
+        if msg == WM_TRAYICON and int(wparam) == TRAY_UID:
+            event = int(lparam) & 0xFFFF
+            if event in (WM_LBUTTONUP, WM_LBUTTONDBLCLK):
+                self.root.after(0, self.on_show)
+                return 0
+            if event in (WM_RBUTTONUP, WM_CONTEXTMENU):
+                self.root.after(0, self._show_menu)
+                return 0
+
+        if self._old_wndproc:
+            return ctypes.windll.user32.CallWindowProcW(
+                self._old_wndproc,
+                hwnd,
+                msg,
+                wparam,
+                lparam,
+            )
+        return ctypes.windll.user32.DefWindowProcW(hwnd, msg, wparam, lparam)
+
+    def _load_icon(self) -> int | None:
+        if not self.icon_path.exists():
+            return None
+        user32 = ctypes.windll.user32
+        width = user32.GetSystemMetrics(SM_CXSMICON) or 16
+        height = user32.GetSystemMetrics(SM_CYSMICON) or 16
+        hicon = user32.LoadImageW(None, str(self.icon_path), IMAGE_ICON, width, height, LR_LOADFROMFILE)
+        if not hicon:
+            hicon = user32.LoadImageW(None, str(self.icon_path), IMAGE_ICON, 0, 0, LR_LOADFROMFILE | LR_DEFAULTSIZE)
+        return int(hicon) if hicon else None
+
+    def _notify_data(self) -> NOTIFYICONDATAW:
+        data = NOTIFYICONDATAW()
+        data.cbSize = ctypes.sizeof(NOTIFYICONDATAW)
+        data.hWnd = self.hwnd
+        data.uID = TRAY_UID
+        data.uFlags = NIF_MESSAGE | NIF_TIP
+        data.uCallbackMessage = WM_TRAYICON
+        data.szTip = APP_TITLE[:127]
+        if self.hicon:
+            data.uFlags |= NIF_ICON
+            data.hIcon = self.hicon
+        return data
+
+    def show(self) -> None:
+        if sys.platform != "win32" or self.visible:
+            return
+        if self.hicon is None:
+            self.hicon = self._load_icon()
+        data = self._notify_data()
+        if ctypes.windll.shell32.Shell_NotifyIconW(NIM_ADD, ctypes.byref(data)):
+            self.visible = True
+
+    def hide(self) -> None:
+        if sys.platform != "win32" or not self.visible:
+            return
+        data = NOTIFYICONDATAW()
+        data.cbSize = ctypes.sizeof(NOTIFYICONDATAW)
+        data.hWnd = self.hwnd
+        data.uID = TRAY_UID
+        ctypes.windll.shell32.Shell_NotifyIconW(NIM_DELETE, ctypes.byref(data))
+        self.visible = False
+
+    def destroy(self) -> None:
+        self.hide()
+        if self._old_wndproc is not None and self._set_window_long_ptr is not None:
+            try:
+                self._set_window_long_ptr(self.hwnd, -4, ctypes.c_void_p(self._old_wndproc))
+            except Exception:
+                pass
+            self._old_wndproc = None
+        if self.hicon:
+            ctypes.windll.user32.DestroyIcon(self.hicon)
+            self.hicon = None
+
+    def _show_menu(self) -> None:
+        if not self.visible:
+            return
+        user32 = ctypes.windll.user32
+        menu = user32.CreatePopupMenu()
+        if not menu:
+            return
+        try:
+            user32.AppendMenuW(menu, MF_STRING, ID_TRAY_SHOW, "打开面板")
+            toggle_text = "关闭小猪" if self.is_running() else "启动小猪"
+            user32.AppendMenuW(menu, MF_STRING, ID_TRAY_TOGGLE, toggle_text)
+            user32.AppendMenuW(menu, MF_SEPARATOR, 0, None)
+            user32.AppendMenuW(menu, MF_STRING, ID_TRAY_EXIT, "退出软件")
+            point = POINT()
+            user32.GetCursorPos(ctypes.byref(point))
+            user32.SetForegroundWindow(self.hwnd)
+            command = user32.TrackPopupMenu(
+                menu,
+                TPM_RIGHTBUTTON | TPM_RETURNCMD,
+                point.x,
+                point.y,
+                0,
+                self.hwnd,
+                None,
+            )
+            user32.PostMessageW(self.hwnd, WM_NULL, 0, 0)
+        finally:
+            user32.DestroyMenu(menu)
+
+        if command:
+            self.root.after(0, self._dispatch_command, int(command))
+
+    def _dispatch_command(self, command: int) -> None:
+        if command == ID_TRAY_SHOW:
+            self.on_show()
+        elif command == ID_TRAY_TOGGLE:
+            self.on_toggle()
+        elif command == ID_TRAY_EXIT:
+            self.on_exit()
 
 
 def _resample_filter() -> int:
@@ -609,8 +869,8 @@ class PigPointerApp:
         self.renderer = GifRenderer(gif_path, root)
 
         self.running = False
-        self.bubble: tk.Toplevel | None = None
         self.overlay: AlphaOverlay | None = None
+        self.tray_icon: SystemTrayIcon | None = None
         self.preview_photo: ImageTk.PhotoImage | None = None
         self.preview_last_time = 0.0
         self.overlay_last_draw_time = 0.0
@@ -780,6 +1040,14 @@ class PigPointerApp:
 
     def _build_overlay(self) -> None:
         self.overlay = AlphaOverlay(APP_TITLE)
+        self.tray_icon = SystemTrayIcon(
+            self.root,
+            _resource_path(ICON_NAME),
+            self.restore_from_background,
+            self.toggle_pet_from_tray,
+            self.quit_app,
+            lambda: self.running,
+        )
 
     def _sync_slider_labels(self) -> None:
         self.size_text.set(f"{int(self.size_var.get())} px")
@@ -865,7 +1133,6 @@ class PigPointerApp:
         self.animation_active = False
         self.frame_index = 0
         self.frame_time_ms = 0.0
-        self._hide_bubble()
         self._update_buttons()
 
     def hide_to_background(self) -> None:
@@ -873,7 +1140,8 @@ class PigPointerApp:
             return
         self.background_var.set(True)
         self.root.withdraw()
-        self._show_bubble()
+        if self.tray_icon is not None:
+            self.tray_icon.show()
 
     def _on_close_window(self) -> None:
         if self.running and self.background_var.get():
@@ -883,54 +1151,53 @@ class PigPointerApp:
 
     def quit_app(self) -> None:
         self.running = False
-        self._hide_bubble()
+        if self.tray_icon is not None:
+            self.tray_icon.destroy()
+            self.tray_icon = None
         if self.overlay is not None:
             self.overlay.destroy()
             self.overlay = None
         self.root.destroy()
 
-    def _show_bubble(self) -> None:
-        if self.bubble is not None and self.bubble.winfo_exists():
-            self.bubble.deiconify()
-            return
-
-        self.bubble = tk.Toplevel(self.root)
-        self._apply_window_icon(self.bubble)
-        self.bubble.overrideredirect(True)
-        self.bubble.attributes("-topmost", True)
-        screen_w = self.root.winfo_screenwidth()
-        screen_h = self.root.winfo_screenheight()
-        self.bubble.geometry(f"46x38+{screen_w - 62}+{screen_h - 96}")
-        button = ttk.Button(self.bubble, text="猪", command=self.restore_from_background)
-        button.pack(fill="both", expand=True)
-        button.bind("<Button-3>", lambda _event: self.quit_app())
-
-    def _hide_bubble(self) -> None:
-        if self.bubble is not None:
-            try:
-                self.bubble.destroy()
-            except tk.TclError:
-                pass
-            self.bubble = None
-
     def restore_from_background(self) -> None:
-        self._hide_bubble()
+        if self.tray_icon is not None:
+            self.tray_icon.hide()
         self.root.deiconify()
         self.root.lift()
         self.root.focus_force()
+
+    def toggle_pet_from_tray(self) -> None:
+        if self.running:
+            self.stop_pet()
+        else:
+            self.start_pet()
 
     def _apply_window_icon(self, window: tk.Misc) -> None:
         icon_path = _resource_path(ICON_NAME)
         if not icon_path.exists():
             return
+        photos: list[ImageTk.PhotoImage] = []
+        try:
+            icon_source = Image.open(icon_path)
+            source_sizes = sorted(icon_source.ico.sizes()) if icon_source.format == "ICO" else [icon_source.size]
+            for size in [(16, 16), (32, 32), (48, 48), (256, 256)]:
+                try:
+                    if icon_source.format == "ICO" and size in source_sizes:
+                        icon_image = icon_source.ico.getimage(size).convert("RGBA")
+                    else:
+                        icon_image = icon_source.convert("RGBA").resize(size, _resample_filter())
+                    photos.append(ImageTk.PhotoImage(icon_image, master=window))
+                except Exception:
+                    continue
+            if photos:
+                window.iconphoto(True, *photos)
+                setattr(window, "_pig_pointer_icon_refs", photos)
+        except Exception:
+            pass
         try:
             window.iconbitmap(default=str(icon_path))
         except tk.TclError:
-            try:
-                icon_image = tk.PhotoImage(file=str(icon_path))
-                window.iconphoto(True, icon_image)
-            except tk.TclError:
-                pass
+            pass
 
     def _place_physics_at_cursor(self) -> None:
         anchor_x, anchor_y = self._cursor_anchor()
