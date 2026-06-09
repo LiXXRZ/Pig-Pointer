@@ -734,7 +734,8 @@ class PigPointerApp:
         self.window_icon_handles: list[int] = []
         self.preview_photo: ImageTk.PhotoImage | None = None
         self.preview_last_time = 0.0
-        self.overlay_last_draw_time = 0.0
+        self.cursor_api_ready = False
+        self.timer_resolution_enabled = False
 
         self.size_var = tk.DoubleVar(value=150)
         self.prob_var = tk.DoubleVar(value=15)
@@ -978,6 +979,7 @@ class PigPointerApp:
     def start_pet(self) -> None:
         if self.running:
             return
+        self._set_timer_resolution(True)
         self.running = True
         self._prewarm_current_static_angles()
         self._place_physics_at_cursor()
@@ -995,6 +997,7 @@ class PigPointerApp:
         self.animation_active = False
         self.frame_index = 0
         self.frame_time_ms = 0.0
+        self._set_timer_resolution(False)
         self._update_buttons()
 
     def hide_to_background(self) -> None:
@@ -1019,6 +1022,7 @@ class PigPointerApp:
         if self.overlay is not None:
             self.overlay.destroy()
             self.overlay = None
+        self._set_timer_resolution(False)
         self._destroy_window_icons()
         self.root.destroy()
 
@@ -1137,8 +1141,23 @@ class PigPointerApp:
         self.trigger_timer = 0.0
 
     def _cursor_anchor(self) -> tuple[float, float]:
-        pointer_x, pointer_y = self.root.winfo_pointerxy()
+        pointer_x, pointer_y = self._cursor_position()
         return (pointer_x + self.anchor_x_var.get(), pointer_y + self.anchor_y_var.get())
+
+    def _cursor_position(self) -> tuple[int, int]:
+        if sys.platform == "win32":
+            try:
+                user32 = ctypes.windll.user32
+                if not self.cursor_api_ready:
+                    user32.GetCursorPos.argtypes = [ctypes.POINTER(POINT)]
+                    user32.GetCursorPos.restype = wintypes.BOOL
+                    self.cursor_api_ready = True
+                point = POINT()
+                if user32.GetCursorPos(ctypes.byref(point)):
+                    return (int(point.x), int(point.y))
+            except Exception:
+                pass
+        return self.root.winfo_pointerxy()
 
     def _rest_length(self) -> float:
         return max(38.0, self.size_var.get() * 0.43)
@@ -1148,6 +1167,20 @@ class PigPointerApp:
 
     def _weight_factor(self) -> float:
         return max(0.0, min(1.0, self.weight_var.get() / 100.0))
+
+    def _set_timer_resolution(self, enabled: bool) -> None:
+        if sys.platform != "win32" or enabled == self.timer_resolution_enabled:
+            return
+        try:
+            winmm = ctypes.windll.winmm
+            if enabled:
+                if winmm.timeBeginPeriod(1) == 0:
+                    self.timer_resolution_enabled = True
+            else:
+                if winmm.timeEndPeriod(1) == 0:
+                    self.timer_resolution_enabled = False
+        except Exception:
+            pass
 
     def _tick(self) -> None:
         now = time.perf_counter()
@@ -1165,11 +1198,9 @@ class PigPointerApp:
             self.preview_last_time = now
         if self.running:
             self._update_physics(dt)
-            if now - self.overlay_last_draw_time >= 1 / 60:
-                self._draw_overlay()
-                self.overlay_last_draw_time = now
+            self._draw_overlay()
 
-        self.root.after(5, self._tick)
+        self.root.after(1 if self.running else 5, self._tick)
 
     def _advance_animation(self, dt: float) -> None:
         probability = self.prob_var.get() / 100.0
@@ -1238,15 +1269,7 @@ class PigPointerApp:
         self.rope_end_x += self.rope_vel_x * dt
         self.rope_end_y += self.rope_vel_y * dt
 
-        dx = self.rope_end_x - anchor_x
-        dy = self.rope_end_y - anchor_y
-        distance = max(1.0, math.hypot(dx, dy))
-        self.rope_end_x = anchor_x + dx / distance * rope_length
-        self.rope_end_y = anchor_y + dy / distance * rope_length
-
-        radial_velocity = self.rope_vel_x * (dx / distance) + self.rope_vel_y * (dy / distance)
-        self.rope_vel_x -= radial_velocity * (dx / distance)
-        self.rope_vel_y -= radial_velocity * (dy / distance)
+        self._constrain_rope_to_anchor(anchor_x, anchor_y, rope_length)
 
         self.pig_x = self.rope_end_x
         self.pig_y = self.rope_end_y
@@ -1264,13 +1287,31 @@ class PigPointerApp:
         self.pig_angular_velocity *= max(0.0, 1.0 - rotation_damping * dt)
         self.pig_angle += self.pig_angular_velocity * dt
 
+    def _constrain_rope_to_anchor(self, anchor_x: float, anchor_y: float, rope_length: float) -> None:
+        dx = self.rope_end_x - anchor_x
+        dy = self.rope_end_y - anchor_y
+        distance = math.hypot(dx, dy)
+        if distance < 1.0:
+            dx, dy, distance = 0.0, rope_length, rope_length
+        nx = dx / distance
+        ny = dy / distance
+        self.rope_end_x = anchor_x + nx * rope_length
+        self.rope_end_y = anchor_y + ny * rope_length
+
+        radial_velocity = self.rope_vel_x * nx + self.rope_vel_y * ny
+        self.rope_vel_x -= radial_velocity * nx
+        self.rope_vel_y -= radial_velocity * ny
+
     def _draw_overlay(self) -> None:
         if self.overlay is None:
             return
         display_height = int(self.size_var.get())
         angle = math.degrees(self.pig_angle)
         image, joint, _bgra = self.renderer.render_asset(self.frame_index, display_height, angle)
-        anchor_x, anchor_y = self.last_anchor
+        anchor_x, anchor_y = self._cursor_anchor()
+        self._constrain_rope_to_anchor(anchor_x, anchor_y, self._rope_length())
+        self.pig_x = self.rope_end_x
+        self.pig_y = self.rope_end_y
         image_x = self.pig_x - joint[0]
         image_y = self.pig_y - joint[1]
 
