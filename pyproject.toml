@@ -1,0 +1,15 @@
+[project]
+name = "pig-pointer"
+version = "0.1.0"
+description = "A tiny Windows desktop pet tied to the mouse pointer."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "Pillow>=11.1.0",
+  "numpy>=2.2.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pyinstaller>=6.0",
+]
