@@ -42,6 +42,7 @@ AC_SRC_OVER = 0
 AC_SRC_ALPHA = 1
 BI_RGB = 0
 DIB_RGB_COLORS = 0
+WM_SETICON = 0x0080
 WM_NCHITTEST = 0x0084
 HTTRANSPARENT = -1
 ERROR_CLASS_ALREADY_EXISTS = 1410
@@ -58,8 +59,13 @@ NIF_MESSAGE = 0x00000001
 NIF_ICON = 0x00000002
 NIF_TIP = 0x00000004
 IMAGE_ICON = 1
+ICON_SMALL = 0
+ICON_BIG = 1
+ICON_SMALL2 = 2
 LR_LOADFROMFILE = 0x00000010
 LR_DEFAULTSIZE = 0x00000040
+SM_CXICON = 11
+SM_CYICON = 12
 SM_CXSMICON = 49
 SM_CYSMICON = 50
 MF_STRING = 0x00000000
@@ -380,7 +386,9 @@ class NOTIFYICONDATAW(ctypes.Structure):
 
 class SystemTrayIcon:
     _api_ready = False
-    _set_window_long_ptr = None
+    _class_name = "PigPointerTrayMessageWindow"
+    _registered = False
+    _instances: dict[int, "SystemTrayIcon"] = {}
 
     def __init__(
         self,
@@ -397,15 +405,14 @@ class SystemTrayIcon:
         self.on_toggle = on_toggle
         self.on_exit = on_exit
         self.is_running = is_running
-        self.hwnd = wintypes.HWND(root.winfo_id())
+        self.hwnd: int | None = None
         self.hicon: int | None = None
         self.visible = False
-        self._old_wndproc: int | None = None
-        self._wndproc_ref = WNDPROC(self._window_proc)
 
         if sys.platform == "win32":
             self._configure_api()
-            self._subclass_window()
+            self._register_class()
+            self._create_message_window()
 
     @classmethod
     def _configure_api(cls) -> None:
@@ -414,10 +421,34 @@ class SystemTrayIcon:
 
         user32 = ctypes.windll.user32
         shell32 = ctypes.windll.shell32
+        kernel32 = ctypes.windll.kernel32
 
+        kernel32.GetModuleHandleW.argtypes = [wintypes.LPCWSTR]
+        kernel32.GetModuleHandleW.restype = wintypes.HMODULE
         shell32.Shell_NotifyIconW.argtypes = [wintypes.DWORD, ctypes.POINTER(NOTIFYICONDATAW)]
         shell32.Shell_NotifyIconW.restype = wintypes.BOOL
 
+        user32.RegisterClassW.argtypes = [ctypes.POINTER(WNDCLASSW)]
+        user32.RegisterClassW.restype = wintypes.ATOM
+        user32.CreateWindowExW.argtypes = [
+            wintypes.DWORD,
+            wintypes.LPCWSTR,
+            wintypes.LPCWSTR,
+            wintypes.DWORD,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            wintypes.HWND,
+            wintypes.HMENU,
+            wintypes.HINSTANCE,
+            wintypes.LPVOID,
+        ]
+        user32.CreateWindowExW.restype = wintypes.HWND
+        user32.DestroyWindow.argtypes = [wintypes.HWND]
+        user32.DestroyWindow.restype = wintypes.BOOL
+        user32.DefWindowProcW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+        user32.DefWindowProcW.restype = LRESULT
         user32.LoadImageW.argtypes = [
             wintypes.HINSTANCE,
             wintypes.LPCWSTR,
@@ -431,14 +462,6 @@ class SystemTrayIcon:
         user32.DestroyIcon.restype = wintypes.BOOL
         user32.GetSystemMetrics.argtypes = [ctypes.c_int]
         user32.GetSystemMetrics.restype = ctypes.c_int
-        user32.CallWindowProcW.argtypes = [
-            ctypes.c_void_p,
-            wintypes.HWND,
-            wintypes.UINT,
-            wintypes.WPARAM,
-            wintypes.LPARAM,
-        ]
-        user32.CallWindowProcW.restype = LRESULT
         user32.CreatePopupMenu.argtypes = []
         user32.CreatePopupMenu.restype = wintypes.HMENU
         user32.AppendMenuW.argtypes = [wintypes.HMENU, wintypes.UINT, UINT_PTR, wintypes.LPCWSTR]
@@ -462,20 +485,57 @@ class SystemTrayIcon:
         user32.PostMessageW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
         user32.PostMessageW.restype = wintypes.BOOL
 
-        if ctypes.sizeof(ctypes.c_void_p) == 8:
-            cls._set_window_long_ptr = user32.SetWindowLongPtrW
-        else:
-            cls._set_window_long_ptr = user32.SetWindowLongW
-        cls._set_window_long_ptr.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_void_p]
-        cls._set_window_long_ptr.restype = ctypes.c_void_p
-
         cls._api_ready = True
 
-    def _subclass_window(self) -> None:
-        if self._old_wndproc is not None or self._set_window_long_ptr is None:
+    @classmethod
+    def _register_class(cls) -> None:
+        if cls._registered:
             return
-        new_wndproc = ctypes.cast(self._wndproc_ref, ctypes.c_void_p)
-        self._old_wndproc = self._set_window_long_ptr(self.hwnd, -4, new_wndproc)
+        hinstance = ctypes.windll.kernel32.GetModuleHandleW(None)
+        wndclass = WNDCLASSW()
+        if not hasattr(cls, "_class_proc_ref"):
+            cls._class_proc_ref = WNDPROC(cls._class_window_proc)
+        wndclass.lpfnWndProc = cls._class_proc_ref
+        wndclass.hInstance = hinstance
+        wndclass.lpszClassName = cls._class_name
+        atom = ctypes.windll.user32.RegisterClassW(ctypes.byref(wndclass))
+        if not atom:
+            error = ctypes.get_last_error()
+            if error != ERROR_CLASS_ALREADY_EXISTS:
+                raise ctypes.WinError(error)
+        cls._registered = True
+
+    def _create_message_window(self) -> None:
+        hinstance = ctypes.windll.kernel32.GetModuleHandleW(None)
+        self.hwnd = ctypes.windll.user32.CreateWindowExW(
+            0,
+            self._class_name,
+            APP_TITLE,
+            0,
+            0,
+            0,
+            0,
+            0,
+            None,
+            None,
+            hinstance,
+            None,
+        )
+        if not self.hwnd:
+            raise ctypes.WinError(ctypes.get_last_error())
+        self._instances[int(self.hwnd)] = self
+
+    @staticmethod
+    def _class_window_proc(
+        hwnd: wintypes.HWND,
+        msg: wintypes.UINT,
+        wparam: wintypes.WPARAM,
+        lparam: wintypes.LPARAM,
+    ) -> int:
+        tray = SystemTrayIcon._instances.get(int(hwnd))
+        if tray is not None:
+            return tray._window_proc(hwnd, msg, wparam, lparam)
+        return ctypes.windll.user32.DefWindowProcW(hwnd, msg, wparam, lparam)
 
     def _window_proc(
         self,
@@ -493,31 +553,21 @@ class SystemTrayIcon:
                 self.root.after(0, self._show_menu)
                 return 0
 
-        if self._old_wndproc:
-            return ctypes.windll.user32.CallWindowProcW(
-                self._old_wndproc,
-                hwnd,
-                msg,
-                wparam,
-                lparam,
-            )
         return ctypes.windll.user32.DefWindowProcW(hwnd, msg, wparam, lparam)
 
     def _load_icon(self) -> int | None:
-        if not self.icon_path.exists():
-            return None
         user32 = ctypes.windll.user32
         width = user32.GetSystemMetrics(SM_CXSMICON) or 16
         height = user32.GetSystemMetrics(SM_CYSMICON) or 16
-        hicon = user32.LoadImageW(None, str(self.icon_path), IMAGE_ICON, width, height, LR_LOADFROMFILE)
-        if not hicon:
+        hicon = _load_windows_icon(self.icon_path, width, height)
+        if hicon is None:
             hicon = user32.LoadImageW(None, str(self.icon_path), IMAGE_ICON, 0, 0, LR_LOADFROMFILE | LR_DEFAULTSIZE)
         return int(hicon) if hicon else None
 
     def _notify_data(self) -> NOTIFYICONDATAW:
         data = NOTIFYICONDATAW()
         data.cbSize = ctypes.sizeof(NOTIFYICONDATAW)
-        data.hWnd = self.hwnd
+        data.hWnd = self.hwnd or 0
         data.uID = TRAY_UID
         data.uFlags = NIF_MESSAGE | NIF_TIP
         data.uCallbackMessage = WM_TRAYICON
@@ -528,7 +578,7 @@ class SystemTrayIcon:
         return data
 
     def show(self) -> None:
-        if sys.platform != "win32" or self.visible:
+        if sys.platform != "win32" or self.visible or self.hwnd is None:
             return
         if self.hicon is None:
             self.hicon = self._load_icon()
@@ -537,7 +587,7 @@ class SystemTrayIcon:
             self.visible = True
 
     def hide(self) -> None:
-        if sys.platform != "win32" or not self.visible:
+        if sys.platform != "win32" or not self.visible or self.hwnd is None:
             return
         data = NOTIFYICONDATAW()
         data.cbSize = ctypes.sizeof(NOTIFYICONDATAW)
@@ -548,12 +598,13 @@ class SystemTrayIcon:
 
     def destroy(self) -> None:
         self.hide()
-        if self._old_wndproc is not None and self._set_window_long_ptr is not None:
+        if self.hwnd is not None:
             try:
-                self._set_window_long_ptr(self.hwnd, -4, ctypes.c_void_p(self._old_wndproc))
+                self._instances.pop(int(self.hwnd), None)
+                ctypes.windll.user32.DestroyWindow(self.hwnd)
             except Exception:
                 pass
-            self._old_wndproc = None
+            self.hwnd = None
         if self.hicon:
             ctypes.windll.user32.DestroyIcon(self.hicon)
             self.hicon = None
@@ -597,6 +648,23 @@ class SystemTrayIcon:
             self.on_toggle()
         elif command == ID_TRAY_EXIT:
             self.on_exit()
+
+
+def _load_windows_icon(icon_path: Path, width: int, height: int) -> int | None:
+    if sys.platform != "win32" or not icon_path.exists():
+        return None
+    user32 = ctypes.windll.user32
+    user32.LoadImageW.argtypes = [
+        wintypes.HINSTANCE,
+        wintypes.LPCWSTR,
+        wintypes.UINT,
+        ctypes.c_int,
+        ctypes.c_int,
+        wintypes.UINT,
+    ]
+    user32.LoadImageW.restype = wintypes.HANDLE
+    hicon = user32.LoadImageW(None, str(icon_path), IMAGE_ICON, width, height, LR_LOADFROMFILE)
+    return int(hicon) if hicon else None
 
 
 def _resample_filter() -> int:
@@ -871,6 +939,7 @@ class PigPointerApp:
         self.running = False
         self.overlay: AlphaOverlay | None = None
         self.tray_icon: SystemTrayIcon | None = None
+        self.window_icon_handles: list[int] = []
         self.preview_photo: ImageTk.PhotoImage | None = None
         self.preview_last_time = 0.0
         self.overlay_last_draw_time = 0.0
@@ -1016,6 +1085,7 @@ class PigPointerApp:
         ttk.Button(status_row, text="退出软件", command=self.quit_app).pack(side="right")
 
         self._update_buttons()
+        self.root.after(250, self._refresh_taskbar_icon)
 
     def _add_slider(
         self,
@@ -1157,6 +1227,7 @@ class PigPointerApp:
         if self.overlay is not None:
             self.overlay.destroy()
             self.overlay = None
+        self._destroy_window_icons()
         self.root.destroy()
 
     def restore_from_background(self) -> None:
@@ -1198,6 +1269,61 @@ class PigPointerApp:
             window.iconbitmap(default=str(icon_path))
         except tk.TclError:
             pass
+        self._apply_native_window_icon(window, icon_path)
+
+    def _apply_native_window_icon(self, window: tk.Misc, icon_path: Path) -> None:
+        if sys.platform != "win32" or not icon_path.exists():
+            return
+        try:
+            hwnd = self._window_frame_handle(window)
+            user32 = ctypes.windll.user32
+            user32.GetSystemMetrics.argtypes = [ctypes.c_int]
+            user32.GetSystemMetrics.restype = ctypes.c_int
+            user32.SendMessageW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+            user32.SendMessageW.restype = wintypes.LPARAM
+            small_w = user32.GetSystemMetrics(SM_CXSMICON) or 16
+            small_h = user32.GetSystemMetrics(SM_CYSMICON) or 16
+            big_w = user32.GetSystemMetrics(SM_CXICON) or 32
+            big_h = user32.GetSystemMetrics(SM_CYICON) or 32
+            small_icon = _load_windows_icon(icon_path, small_w, small_h)
+            big_icon = _load_windows_icon(icon_path, big_w, big_h)
+            if small_icon:
+                user32.SendMessageW(hwnd, WM_SETICON, ICON_SMALL, small_icon)
+                user32.SendMessageW(hwnd, WM_SETICON, ICON_SMALL2, small_icon)
+                self.window_icon_handles.append(small_icon)
+            if big_icon:
+                user32.SendMessageW(hwnd, WM_SETICON, ICON_BIG, big_icon)
+                self.window_icon_handles.append(big_icon)
+        except Exception:
+            pass
+
+    def _window_frame_handle(self, window: tk.Misc) -> int:
+        try:
+            window.update_idletasks()
+            frame = window.tk.call("wm", "frame", window._w)
+            hwnd = int(str(frame), 0)
+            if hwnd:
+                return hwnd
+        except Exception:
+            pass
+        return int(window.winfo_id())
+
+    def _refresh_taskbar_icon(self) -> None:
+        try:
+            if self.root.winfo_exists():
+                self._apply_native_window_icon(self.root, _resource_path(ICON_NAME))
+        except tk.TclError:
+            pass
+
+    def _destroy_window_icons(self) -> None:
+        if sys.platform != "win32":
+            return
+        for hicon in self.window_icon_handles:
+            try:
+                ctypes.windll.user32.DestroyIcon(hicon)
+            except Exception:
+                pass
+        self.window_icon_handles.clear()
 
     def _place_physics_at_cursor(self) -> None:
         anchor_x, anchor_y = self._cursor_anchor()
