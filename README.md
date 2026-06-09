@@ -28,6 +28,7 @@
 - Python 3.10+
 - Pillow
 - NumPy
+- pystray
 
 ## 从源码运行
 
