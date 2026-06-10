@@ -4,11 +4,9 @@
 
 ## 界面预览
 
-![猪猪指针界面预览](docs/assets/preview.png)
-
-默认猪猪 GIF：
-
-![默认猪猪 GIF](pig_pointer.gif)
+| 软件界面 | 默认猪猪 GIF |
+| --- | --- |
+| <img src="docs/assets/preview.png" alt="猪猪指针界面预览" width="320"> | <img src="pig_pointer.gif" alt="默认猪猪 GIF" width="260"> |
 
 ## 下载与运行
 
