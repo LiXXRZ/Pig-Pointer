@@ -1,0 +1,25 @@
+name: 功能建议
+description: 提出新功能、交互优化或体验改进。
+title: "[Feature] "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: 想解决的问题
+      description: 这个建议是为了解决什么不方便？
+      placeholder: 例如：希望不同资源可以保存成一组预设。
+    validations:
+      required: true
+  - type: textarea
+    id: solution
+    attributes:
+      label: 期望方案
+      description: 你希望软件怎么做？
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: 其他想法
+      description: 有没有其他可接受的实现方式？

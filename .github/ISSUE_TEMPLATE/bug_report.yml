@@ -1,0 +1,40 @@
+name: Bug 反馈
+description: 反馈软件异常、显示错误或交互问题。
+title: "[Bug] "
+labels: ["bug"]
+body:
+  - type: textarea
+    id: description
+    attributes:
+      label: 问题描述
+      description: 发生了什么？请尽量描述清楚现象。
+      placeholder: 例如：开启自定义模式后，某个 GIF 的绳子连接点偏移。
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: 复现步骤
+      description: 如何稳定复现这个问题？
+      placeholder: |
+        1. 打开软件
+        2. 勾选自定义模式
+        3. 添加某个 GIF
+        4. ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: 期望表现
+      placeholder: 你原本希望它怎么工作？
+  - type: textarea
+    id: environment
+    attributes:
+      label: 环境信息
+      placeholder: Windows 版本、软件版本、是否使用打包版等。
+  - type: textarea
+    id: attachments
+    attributes:
+      label: 截图或素材
+      description: 如果方便，可以附上截图、GIF 或问题素材。
