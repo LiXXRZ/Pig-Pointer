@@ -7,9 +7,7 @@ __pycache__/
 venv/
 env/
 build/
-dist/*
-!dist/
-!dist/PigPointer.exe
+dist/
 *.spec
 *.log
 debug_*.png

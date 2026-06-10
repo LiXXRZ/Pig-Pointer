@@ -1,5 +1,10 @@
 # 猪猪指针
 
+[![Build Windows EXE](https://github.com/LiXXRZ/Pig-Pointer/actions/workflows/build-windows.yml/badge.svg)](https://github.com/LiXXRZ/Pig-Pointer/actions/workflows/build-windows.yml)
+[![Release](https://img.shields.io/github/v/release/LiXXRZ/Pig-Pointer?label=release)](https://github.com/LiXXRZ/Pig-Pointer/releases/latest)
+[![License: MIT](https://img.shields.io/github/license/LiXXRZ/Pig-Pointer)](LICENSE)
+![Platform](https://img.shields.io/badge/platform-Windows-blue)
+
 一个 Windows 桌面小挂件：把会动的小猪或你自己上传的图片 / GIF 通过绳子挂在鼠标后面。它使用逐像素透明窗口绘制，默认不挡住正常点击；也可以开启“绝对绑定模式”，隐藏系统鼠标并由软件自己绘制当前鼠标。
 
 ## 界面预览
@@ -10,11 +15,10 @@
 
 ## 下载与运行
 
-最简单的方式是直接运行已打包版本：
+最简单的方式是从 GitHub Release 下载已打包版本：
 
-```text
-dist\PigPointer.exe
-```
+- [下载 PigPointer.exe](https://github.com/LiXXRZ/Pig-Pointer/releases/latest/download/PigPointer.exe)
+- [查看所有发布版本](https://github.com/LiXXRZ/Pig-Pointer/releases)
 
 从源码运行：
 
@@ -28,6 +32,13 @@ python pig_pointer.py
 ```text
 start_pig_pointer.bat
 ```
+
+## 使用注意
+
+- 目前仅面向 Windows 桌面环境。
+- Release 中的 EXE 没有代码签名，首次运行时 Windows SmartScreen 可能会提示风险。
+- 默认透明层不会挡住鼠标点击；开启“绝对绑定模式”后，软件会隐藏真实鼠标并自行绘制鼠标。
+- 上传大量图片 / GIF、启用较大尺寸或开启多资源碰撞时，性能占用会升高。
 
 ## 功能亮点
 
@@ -133,10 +144,11 @@ dist\PigPointer.exe
 ├─ pig_pointer.ico         软件图标
 ├─ start_pig_pointer.bat   源码运行启动脚本
 ├─ build.ps1               PyInstaller 打包脚本
-├─ dist/PigPointer.exe     已打包的 Windows 可执行文件
 ├─ requirements.txt        运行依赖
 └─ requirements-dev.txt    打包依赖
 ```
+
+`dist/PigPointer.exe` 是本地打包产物，不纳入源码仓库；正式下载请使用 GitHub Release。
 
 ## 技术路线
 
