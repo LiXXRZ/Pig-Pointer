@@ -50,6 +50,8 @@ WS_EX_TOPMOST = 0x00000008
 WS_EX_TOOLWINDOW = 0x00000080
 WS_EX_NOACTIVATE = 0x08000000
 WS_POPUP = 0x80000000
+WS_MAXIMIZEBOX = 0x00010000
+GWL_STYLE = -16
 SW_HIDE = 0
 SW_SHOWNOACTIVATE = 4
 ULW_ALPHA = 0x00000002
@@ -98,6 +100,9 @@ DEFAULT_PIG_CUSTOM_ID = "__default_pig__"
 CUSTOM_CONNECTION_MOUSE = "都连到鼠标"
 CUSTOM_CONNECTION_CHAIN = "串成一串"
 CUSTOM_CONNECTION_MODES = (CUSTOM_CONNECTION_MOUSE, CUSTOM_CONNECTION_CHAIN)
+CUSTOM_ATTACH_AUTO = "自动识别"
+CUSTOM_ATTACH_FIXED = "手动固定"
+CUSTOM_ATTACH_MODES = (CUSTOM_ATTACH_AUTO, CUSTOM_ATTACH_FIXED)
 CUSTOM_ASSET_SUFFIXES = {".gif", ".png", ".jpg", ".jpeg", ".webp", ".bmp"}
 ROPE_COLORS = OrderedDict(
     (
@@ -119,6 +124,7 @@ DEFAULT_GLOBAL_SETTINGS = {
     "trigger_interval": 4.0,
     "weight": 70.0,
     "rope_length": 72.0,
+    "rope_width": 4.0,
     "performance_mode": "普通",
     "absolute_binding": False,
     "background": True,
@@ -140,6 +146,11 @@ DEFAULT_CUSTOM_ASSET_SETTINGS = {
     "collision_radius": 46.0,
     "weight": 70.0,
     "reverse_loop": True,
+    "attach_mode": CUSTOM_ATTACH_AUTO,
+    "attach_x": 50.0,
+    "attach_y": 0.0,
+    "always_animate": False,
+    "rope_width": 3.0,
 }
 CUSTOM_RESOURCE_PRESETS = OrderedDict(
     (
@@ -207,6 +218,11 @@ class CustomAssetConfig:
     collision_radius: float = 46.0
     weight: float = 70.0
     reverse_loop: bool = True
+    attach_mode: str = CUSTOM_ATTACH_AUTO
+    attach_x: float = 50.0
+    attach_y: float = 0.0
+    always_animate: bool = False
+    rope_width: float = 3.0
 
     @classmethod
     def from_dict(cls, data: object) -> "CustomAssetConfig | None":
@@ -227,6 +243,9 @@ class CustomAssetConfig:
         custom_rope_color = data.get("custom_rope_color")
         if not isinstance(custom_rope_color, str) or not _is_hex_color(custom_rope_color):
             custom_rope_color = "#744d2d"
+        attach_mode = data.get("attach_mode")
+        if not isinstance(attach_mode, str) or attach_mode not in CUSTOM_ATTACH_MODES:
+            attach_mode = CUSTOM_ATTACH_AUTO
         return cls(
             asset_id=asset_id,
             name=name,
@@ -241,6 +260,11 @@ class CustomAssetConfig:
             collision_radius=_clamp(data.get("collision_radius"), 8, 180, 46),
             weight=_clamp(data.get("weight"), 0, 100, 70),
             reverse_loop=bool(data.get("reverse_loop", True)),
+            attach_mode=attach_mode,
+            attach_x=_clamp(data.get("attach_x"), 0, 100, 50),
+            attach_y=_clamp(data.get("attach_y"), 0, 100, 0),
+            always_animate=bool(data.get("always_animate", str(path).lower().endswith(".gif"))),
+            rope_width=_clamp(data.get("rope_width"), 1, 12, 3),
         )
 
     def to_dict(self) -> dict[str, object]:
@@ -258,6 +282,11 @@ class CustomAssetConfig:
             "collision_radius": self.collision_radius,
             "weight": self.weight,
             "reverse_loop": self.reverse_loop,
+            "attach_mode": self.attach_mode,
+            "attach_x": self.attach_x,
+            "attach_y": self.attach_y,
+            "always_animate": self.always_animate,
+            "rope_width": self.rope_width,
         }
 
 
@@ -1333,8 +1362,8 @@ class CustomAssetRenderer:
         self.durations: list[int] = []
         self.joints: list[tuple[float, float]] = []
         self.base_size = (1, 1)
-        self._cache: OrderedDict[tuple[int, int, int], tuple[Image.Image, tuple[float, float], bytes]] = OrderedDict()
-        self._photo_cache: OrderedDict[tuple[int, int, int], tuple[ImageTk.PhotoImage, tuple[float, float]]] = OrderedDict()
+        self._cache: OrderedDict[tuple[object, ...], tuple[Image.Image, tuple[float, float], bytes]] = OrderedDict()
+        self._photo_cache: OrderedDict[tuple[object, ...], tuple[ImageTk.PhotoImage, tuple[float, float]]] = OrderedDict()
         self.cache_limit = 160
         self._load()
 
@@ -1367,6 +1396,31 @@ class CustomAssetRenderer:
                 return (sum(xs) / len(xs), float(y))
         return (frame.width / 2.0, 0.0)
 
+    @staticmethod
+    def _attach_cache_key(attach_mode: str, attach_x: float, attach_y: float) -> tuple[object, ...]:
+        if attach_mode != CUSTOM_ATTACH_FIXED:
+            return (CUSTOM_ATTACH_AUTO,)
+        return (CUSTOM_ATTACH_FIXED, round(_clamp(attach_x, 0, 100, 50), 1), round(_clamp(attach_y, 0, 100, 0), 1))
+
+    def _joint_for_frame(
+        self,
+        resolved_index: int,
+        attach_mode: str,
+        attach_x: float,
+        attach_y: float,
+    ) -> tuple[float, float]:
+        if attach_mode == CUSTOM_ATTACH_FIXED:
+            frame = self.frames[resolved_index]
+            return (
+                frame.width * _clamp(attach_x, 0, 100, 50) / 100.0,
+                frame.height * _clamp(attach_y, 0, 100, 0) / 100.0,
+            )
+        return self.joints[resolved_index]
+
+    def clear_cache(self) -> None:
+        self._cache.clear()
+        self._photo_cache.clear()
+
     def frame_count(self, reverse_loop: bool) -> int:
         if reverse_loop and len(self.frames) > 2:
             return len(self.frames) * 2 - 2
@@ -1393,12 +1447,15 @@ class CustomAssetRenderer:
         angle: float,
         reverse_loop: bool,
         angle_step: int = 2,
+        attach_mode: str = CUSTOM_ATTACH_AUTO,
+        attach_x: float = 50.0,
+        attach_y: float = 0.0,
     ) -> tuple[Image.Image, tuple[float, float], bytes]:
         display_height = max(24, min(420, int(display_height)))
         angle_step = max(1, int(angle_step))
         angle_key = int(round(angle / angle_step) * angle_step)
         resolved_index = self._resolve_frame_index(frame_index, reverse_loop)
-        key = (resolved_index, display_height, angle_key)
+        key = (resolved_index, display_height, angle_key, *self._attach_cache_key(attach_mode, attach_x, attach_y))
         cached = self._cache.get(key)
         if cached is not None:
             self._cache.move_to_end(key)
@@ -1408,7 +1465,7 @@ class CustomAssetRenderer:
         scale = display_height / frame.height
         display_width = max(1, int(round(frame.width * scale)))
         scaled = frame.resize((display_width, display_height), _resample_filter())
-        joint = self.joints[resolved_index]
+        joint = self._joint_for_frame(resolved_index, attach_mode, attach_x, attach_y)
         pivot = (joint[0] * scale, joint[1] * scale)
         rotated, rotated_joint = GifRenderer._rotate_about_joint(scaled, pivot, angle_key)
         result = (rotated, rotated_joint, GifRenderer.to_premultiplied_bgra(rotated))
@@ -1423,16 +1480,27 @@ class CustomAssetRenderer:
         display_height: int,
         angle: float,
         reverse_loop: bool,
+        attach_mode: str = CUSTOM_ATTACH_AUTO,
+        attach_x: float = 50.0,
+        attach_y: float = 0.0,
     ) -> tuple[ImageTk.PhotoImage, tuple[float, float]]:
         display_height = max(24, min(420, int(display_height)))
         angle_key = int(round(angle / 2.0) * 2)
         resolved_index = self._resolve_frame_index(frame_index, reverse_loop)
-        key = (resolved_index, display_height, angle_key)
+        key = (resolved_index, display_height, angle_key, *self._attach_cache_key(attach_mode, attach_x, attach_y))
         cached = self._photo_cache.get(key)
         if cached is not None:
             self._photo_cache.move_to_end(key)
             return cached
-        image, joint, _bgra = self.render_asset(frame_index, display_height, angle_key, reverse_loop)
+        image, joint, _bgra = self.render_asset(
+            frame_index,
+            display_height,
+            angle_key,
+            reverse_loop,
+            attach_mode=attach_mode,
+            attach_x=attach_x,
+            attach_y=attach_y,
+        )
         photo = ImageTk.PhotoImage(image, master=self.tk_master)
         result = (photo, joint)
         self._photo_cache[key] = result
@@ -1468,6 +1536,7 @@ class PigPointerApp:
         self.trigger_interval_var = tk.DoubleVar(value=self._setting_float("trigger_interval", DEFAULT_GLOBAL_SETTINGS["trigger_interval"], 1.0, 20.0))
         self.weight_var = tk.DoubleVar(value=self._setting_float("weight", DEFAULT_GLOBAL_SETTINGS["weight"], 0, 100))
         self.rope_length_var = tk.DoubleVar(value=self._setting_float("rope_length", DEFAULT_GLOBAL_SETTINGS["rope_length"], 36, 160))
+        self.rope_width_var = tk.DoubleVar(value=self._setting_float("rope_width", DEFAULT_GLOBAL_SETTINGS["rope_width"], 1, 12))
         self.performance_mode_var = tk.StringVar(value=self._setting_mode("performance_mode", DEFAULT_GLOBAL_SETTINGS["performance_mode"]))
         self.absolute_binding_var = tk.BooleanVar(value=self._setting_bool("absolute_binding", DEFAULT_GLOBAL_SETTINGS["absolute_binding"]))
         self.background_var = tk.BooleanVar(value=self._setting_bool("background", DEFAULT_GLOBAL_SETTINGS["background"]))
@@ -1496,14 +1565,24 @@ class PigPointerApp:
         self.custom_item_collision_var = tk.DoubleVar(value=46)
         self.custom_item_weight_var = tk.DoubleVar(value=70)
         self.custom_item_reverse_loop_var = tk.BooleanVar(value=True)
+        self.custom_item_always_animate_var = tk.BooleanVar(value=False)
+        self.custom_item_rope_width_var = tk.DoubleVar(value=3)
+        self.custom_item_attach_mode_var = tk.StringVar(value=CUSTOM_ATTACH_AUTO)
+        self.custom_item_attach_x_var = tk.DoubleVar(value=50)
+        self.custom_item_attach_y_var = tk.DoubleVar(value=0)
         self.custom_item_size_text = tk.StringVar()
         self.custom_item_rope_length_text = tk.StringVar()
         self.custom_item_anim_speed_text = tk.StringVar()
         self.custom_item_probability_text = tk.StringVar()
         self.custom_item_collision_text = tk.StringVar()
         self.custom_item_weight_text = tk.StringVar()
+        self.custom_item_rope_width_text = tk.StringVar()
+        self.custom_item_attach_x_text = tk.StringVar()
+        self.custom_item_attach_y_text = tk.StringVar()
         self.custom_color_swatch: tk.Canvas | None = None
         self.custom_color_swatch_rect: int | None = None
+        self.custom_status_label: ttk.Label | None = None
+        self.preview_attach_marker: int | None = None
         self.size_text = tk.StringVar()
         self.prob_text = tk.StringVar()
         self.anchor_x_text = tk.StringVar()
@@ -1512,6 +1591,7 @@ class PigPointerApp:
         self.trigger_interval_text = tk.StringVar()
         self.weight_text = tk.StringVar()
         self.rope_length_text = tk.StringVar()
+        self.rope_width_text = tk.StringVar()
 
         self.frame_index = 0
         self.frame_time_ms = 0.0
@@ -1537,8 +1617,10 @@ class PigPointerApp:
         self.custom_assets = self._load_custom_assets()
         self.custom_renderers: dict[str, CustomAssetRenderer] = {}
         self.custom_states: dict[str, CustomItemState] = {}
+        self.custom_selected_ids: set[str] = set()
         self.custom_syncing_ui = False
         self.custom_preview_photo: ImageTk.PhotoImage | None = None
+        self.custom_preview_bounds: tuple[str, float, float, float, float] | None = None
 
         self._build_control_panel()
         self._build_overlay()
@@ -1663,11 +1745,27 @@ class PigPointerApp:
         self.preview_anchor_ring = self.preview.create_oval(149, 13, 167, 31, outline="#e53935", width=2)
         self.preview_rope = self.preview.create_line(158, 22, 158, 74, fill="#744d2d", width=3, smooth=True)
         self.preview_image = self.preview.create_image(158, 22, anchor="nw")
+        self.preview_attach_marker = self.preview.create_oval(
+            154,
+            18,
+            162,
+            26,
+            fill="#e53935",
+            outline="#ffffff",
+            width=1,
+            state="hidden",
+        )
+        self.preview.bind("<ButtonPress-1>", self._on_preview_attach_drag)
+        self.preview.bind("<B1-Motion>", self._on_preview_attach_drag)
+
+        self.custom_attach_section = ttk.Frame(outer)
+        self._build_custom_attach_panel(self.custom_attach_section)
 
         self.default_settings_section = ttk.Frame(outer)
         self.default_settings_section.pack(fill="x")
         self._add_slider(self.default_settings_section, "GIF 大小", self.size_var, 70, 260, self.size_text)
         self._add_slider(self.default_settings_section, "绳子长度", self.rope_length_var, 36, 160, self.rope_length_text)
+        self._add_slider(self.default_settings_section, "绳子粗细", self.rope_width_var, 1, 12, self.rope_width_text)
         self._add_slider(self.default_settings_section, "重量感", self.weight_var, 0, 100, self.weight_text)
         self._add_slider(self.default_settings_section, "动画触发概率", self.prob_var, 0, 100, self.prob_text)
         self._add_slider(self.default_settings_section, "动画播放速度", self.anim_speed_var, 0.5, 3.0, self.anim_speed_text)
@@ -1689,6 +1787,7 @@ class PigPointerApp:
         self._update_buttons()
         self._refresh_custom_panel()
         self._sync_custom_status()
+        self.root.after(100, self._disable_maximize_button)
         self.root.after(250, self._refresh_taskbar_icon)
 
     def _add_slider(
@@ -1735,6 +1834,37 @@ class PigPointerApp:
             command=lambda _value: change_command(),
         ).pack(fill="x")
 
+    def _build_custom_attach_panel(self, parent: ttk.Frame) -> None:
+        ttk.Label(parent, text="连接点校准", foreground="#5b4636").pack(anchor="w")
+        attach_mode_row = ttk.Frame(parent)
+        attach_mode_row.pack(fill="x", pady=(6, 0))
+        ttk.Label(attach_mode_row, text="连接点模式").pack(side="left")
+        ttk.OptionMenu(
+            attach_mode_row,
+            self.custom_item_attach_mode_var,
+            self.custom_item_attach_mode_var.get(),
+            *CUSTOM_ATTACH_MODES,
+            command=lambda _value: self._on_custom_attach_mode_changed(),
+        ).pack(side="right")
+        self._add_custom_slider(
+            parent,
+            "连接点横向",
+            self.custom_item_attach_x_var,
+            0,
+            100,
+            self.custom_item_attach_x_text,
+            self._on_custom_attach_slider_changed,
+        )
+        self._add_custom_slider(
+            parent,
+            "连接点纵向",
+            self.custom_item_attach_y_var,
+            0,
+            100,
+            self.custom_item_attach_y_text,
+            self._on_custom_attach_slider_changed,
+        )
+
     def _build_custom_panel(self, parent: ttk.Frame) -> None:
         ttk.Separator(parent).pack(fill="x", pady=(0, 10))
         top_row = ttk.Frame(parent)
@@ -1779,7 +1909,13 @@ class PigPointerApp:
             side="left", expand=True, fill="x", padx=(4, 0)
         )
 
-        self.custom_listbox = tk.Listbox(parent, height=4, exportselection=False, activestyle="dotbox")
+        self.custom_listbox = tk.Listbox(
+            parent,
+            height=4,
+            exportselection=False,
+            activestyle="dotbox",
+            selectmode=tk.EXTENDED,
+        )
         self.custom_listbox.pack(fill="x", pady=(0, 8))
         self.custom_listbox.bind("<<ListboxSelect>>", self._on_custom_selection_changed)
 
@@ -1834,6 +1970,14 @@ class PigPointerApp:
             20,
             260,
             self.custom_item_rope_length_text,
+        )
+        self._add_custom_slider(
+            self.custom_editor,
+            "绳子粗细",
+            self.custom_item_rope_width_var,
+            1,
+            12,
+            self.custom_item_rope_width_text,
         )
         color_row = ttk.Frame(self.custom_editor)
         color_row.pack(fill="x", pady=(8, 0))
@@ -1894,10 +2038,16 @@ class PigPointerApp:
         )
         ttk.Checkbutton(
             self.custom_editor,
+            text="GIF 连续播放",
+            variable=self.custom_item_always_animate_var,
+            command=self._on_custom_item_setting_changed,
+        ).pack(anchor="w", pady=(8, 0))
+        ttk.Checkbutton(
+            self.custom_editor,
             text="GIF 往返循环",
             variable=self.custom_item_reverse_loop_var,
             command=self._on_custom_item_setting_changed,
-        ).pack(anchor="w", pady=(8, 0))
+        ).pack(anchor="w", pady=(4, 0))
         self.custom_global_section = ttk.Frame(parent)
         self.custom_global_section.pack(fill="x", pady=(10, 0))
         ttk.Label(self.custom_global_section, text="全局设置", foreground="#5b4636").pack(anchor="w")
@@ -1934,9 +2084,15 @@ class PigPointerApp:
             self.anchor_y_text,
             self._on_setting_changed,
         )
-        ttk.Label(parent, textvariable=self.custom_status_var, foreground="#8a6a43", wraplength=320).pack(
-            fill="x", pady=(8, 0)
+        self.custom_status_label = ttk.Label(
+            parent,
+            textvariable=self.custom_status_var,
+            foreground="#8a6a43",
+            justify="left",
+            wraplength=320,
         )
+        self.custom_status_label.pack(fill="x", pady=(8, 0))
+        parent.bind("<Configure>", self._on_custom_panel_configure, add="+")
 
     def _build_overlay(self) -> None:
         self.overlay = AlphaOverlay(APP_TITLE)
@@ -2018,6 +2174,7 @@ class PigPointerApp:
             "trigger_interval": self.trigger_interval_var.get(),
             "weight": self.weight_var.get(),
             "rope_length": self.rope_length_var.get(),
+            "rope_width": self.rope_width_var.get(),
             "performance_mode": self.performance_mode_var.get(),
             "absolute_binding": self.absolute_binding_var.get(),
             "background": self.background_var.get(),
@@ -2043,6 +2200,7 @@ class PigPointerApp:
         self.anchor_x_text.set(f"{int(self.anchor_x_var.get()):+d} px")
         self.anchor_y_text.set(f"{int(self.anchor_y_var.get()):+d} px")
         self.rope_length_text.set(f"{int(self.rope_length_var.get())} px")
+        self.rope_width_text.set(f"{self.rope_width_var.get():.1f} px")
         self.weight_text.set(f"{int(self.weight_var.get())}%")
         self.anim_speed_text.set(f"{self.anim_speed_var.get():.1f}x")
         self.trigger_interval_text.set(f"{self.trigger_interval_var.get():.0f} s")
@@ -2060,12 +2218,26 @@ class PigPointerApp:
         self.custom_item_probability_text.set(f"{int(self.custom_item_probability_var.get())}%")
         self.custom_item_collision_text.set(f"{int(self.custom_item_collision_var.get())} px")
         self.custom_item_weight_text.set(f"{int(self.custom_item_weight_var.get())}%")
+        self.custom_item_rope_width_text.set(f"{self.custom_item_rope_width_var.get():.1f} px")
+        self.custom_item_attach_x_text.set(f"{int(self.custom_item_attach_x_var.get())}%")
+        self.custom_item_attach_y_text.set(f"{int(self.custom_item_attach_y_var.get())}%")
         try:
             color_is_custom = self.custom_item_rope_color_var.get() == "自定义"
             self.custom_color_button.state(["!disabled"] if color_is_custom else ["disabled"])
         except AttributeError:
             pass
         self._sync_custom_color_swatch()
+        self._sync_custom_status_wrap()
+
+    def _on_custom_panel_configure(self, event: tk.Event) -> None:
+        self._sync_custom_status_wrap(event.width)
+
+    def _sync_custom_status_wrap(self, width: int | None = None) -> None:
+        if self.custom_status_label is None:
+            return
+        panel_width = width if width is not None else self.custom_section.winfo_width()
+        wrap = max(240, min(520, panel_width - 24))
+        self.custom_status_label.configure(wraplength=wrap)
 
     def _sync_custom_assets_dir_text(self) -> None:
         path = self.custom_assets_dir_var.get()
@@ -2104,6 +2276,7 @@ class PigPointerApp:
             collision_radius=max(24.0, float(self.size_var.get()) * 0.32),
             weight=float(self.weight_var.get()),
             reverse_loop=True,
+            rope_width=float(self.rope_width_var.get()),
         )
 
     def _custom_asset_choices(self) -> list[CustomAssetConfig]:
@@ -2130,11 +2303,20 @@ class PigPointerApp:
                 return asset
         return None
 
+    def _selected_custom_assets(self) -> list[CustomAssetConfig]:
+        selected_ids = set(self.custom_selected_ids)
+        if not selected_ids and self.custom_selected_id.get():
+            selected_ids.add(self.custom_selected_id.get())
+        choices = self._custom_asset_choices()
+        return [asset for asset in choices if asset.asset_id in selected_ids]
+
     def _refresh_custom_panel(self) -> None:
         if self.custom_mode_var.get():
             self.default_settings_section.pack_forget()
+            self.custom_attach_section.pack(fill="x", pady=(0, 14), before=self.status_separator)
             self.custom_section.pack(fill="x", pady=(14, 0), before=self.status_separator)
         else:
+            self.custom_attach_section.pack_forget()
             self.custom_section.pack_forget()
             self.default_settings_section.pack(fill="x", before=self.status_separator)
         self._refresh_custom_asset_list()
@@ -2146,15 +2328,21 @@ class PigPointerApp:
         self.custom_listbox.delete(0, tk.END)
         selected_index = None
         choices = self._custom_asset_choices()
+        selected_ids = set(self.custom_selected_ids)
+        if not selected_ids and self.custom_selected_id.get():
+            selected_ids.add(self.custom_selected_id.get())
         for index, asset in enumerate(choices):
             marker = "✓" if asset.enabled else " "
             missing = "" if asset.asset_id == DEFAULT_PIG_CUSTOM_ID or Path(asset.path).exists() else "（文件缺失）"
             self.custom_listbox.insert(tk.END, f"{index + 1}. [{marker}] {asset.name}{missing}")
+            if asset.asset_id in selected_ids:
+                self.custom_listbox.selection_set(index)
             if asset.asset_id == self.custom_selected_id.get():
                 selected_index = index
         if selected_index is None and choices:
             selected_index = 0
             self.custom_selected_id.set(choices[0].asset_id)
+            self.custom_selected_ids = {choices[0].asset_id}
         if selected_index is not None:
             self.custom_listbox.selection_set(selected_index)
             self.custom_listbox.activate(selected_index)
@@ -2166,8 +2354,17 @@ class PigPointerApp:
             if asset is None:
                 self.custom_item_name_var.set("未选择资源")
                 self.custom_item_enabled_var.set(False)
+                self.custom_item_attach_mode_var.set(CUSTOM_ATTACH_AUTO)
+                self.custom_item_attach_x_var.set(50)
+                self.custom_item_attach_y_var.set(0)
+                self.custom_item_always_animate_var.set(False)
+                self.custom_item_rope_width_var.set(3)
                 return
-            self.custom_item_name_var.set(asset.name)
+            selected_count = len(self._selected_custom_assets())
+            if selected_count > 1:
+                self.custom_item_name_var.set(f"已选 {selected_count} 个资源（以 {asset.name} 为模板）")
+            else:
+                self.custom_item_name_var.set(asset.name)
             self.custom_item_enabled_var.set(asset.enabled)
             self.custom_item_size_var.set(asset.size)
             self.custom_item_rope_length_var.set(asset.rope_length)
@@ -2177,6 +2374,11 @@ class PigPointerApp:
             self.custom_item_collision_var.set(asset.collision_radius)
             self.custom_item_weight_var.set(asset.weight)
             self.custom_item_reverse_loop_var.set(asset.reverse_loop)
+            self.custom_item_attach_mode_var.set(asset.attach_mode)
+            self.custom_item_attach_x_var.set(asset.attach_x)
+            self.custom_item_attach_y_var.set(asset.attach_y)
+            self.custom_item_always_animate_var.set(asset.always_animate)
+            self.custom_item_rope_width_var.set(asset.rope_width)
         finally:
             self.custom_syncing_ui = False
             self._sync_custom_editor_labels()
@@ -2203,13 +2405,13 @@ class PigPointerApp:
         notes: list[str] = []
         active_count = len(active_assets)
         if active_count >= 12:
-            notes.append("资源数量很多，建议暂停一部分或切到低性能")
+            notes.append("资源很多，可暂停一部分")
         elif active_count >= 7:
-            notes.append("资源数量偏多，透明绘制压力会上升")
+            notes.append("资源偏多，绘制压力会上升")
 
         total_area = sum(asset.size * asset.size for asset in active_assets)
         if total_area >= 260_000:
-            notes.append("总显示面积很大，缩小部分资源会更稳")
+            notes.append("总面积很大，缩小会更稳")
         elif total_area >= 150_000:
             notes.append("总显示面积偏大")
 
@@ -2217,14 +2419,14 @@ class PigPointerApp:
         total_frames = sum(frame_counts)
         gif_count = sum(1 for count in frame_counts if count > 1)
         if total_frames >= 180:
-            notes.append(f"GIF 总帧数约 {total_frames} 帧，动画缓存会更吃内存")
+            notes.append("GIF 帧数多，缓存占用会增加")
         elif gif_count >= 4:
-            notes.append(f"同时启用 {gif_count} 个 GIF，动画触发过密会显得卡")
+            notes.append("GIF 较多，触发过密会显得卡")
 
         if self.custom_collision_var.get():
             collision_pairs = active_count * (active_count - 1) // 2
             if collision_pairs >= 45:
-                notes.append(f"碰撞计算约 {collision_pairs} 组，可关闭资源相互碰撞")
+                notes.append("碰撞计算多，可关闭碰撞")
             elif collision_pairs >= 21:
                 notes.append("碰撞对象较多，关闭碰撞会更省")
         elif active_count >= 2:
@@ -2244,8 +2446,10 @@ class PigPointerApp:
     def _on_custom_include_pig_changed(self) -> None:
         if self.custom_include_pig_var.get():
             self.custom_selected_id.set(DEFAULT_PIG_CUSTOM_ID)
+            self.custom_selected_ids = {DEFAULT_PIG_CUSTOM_ID}
         elif self.custom_selected_id.get() == DEFAULT_PIG_CUSTOM_ID:
             self.custom_selected_id.set(self.custom_assets[0].asset_id if self.custom_assets else "")
+            self.custom_selected_ids = {self.custom_selected_id.get()} if self.custom_selected_id.get() else set()
         if self.running:
             self._place_custom_physics_at_cursor()
         self._refresh_custom_panel()
@@ -2261,15 +2465,30 @@ class PigPointerApp:
         self._sync_custom_status()
         self._schedule_save_settings()
 
+    def _on_custom_attach_mode_changed(self) -> None:
+        if self.custom_item_attach_mode_var.get() == CUSTOM_ATTACH_FIXED:
+            self._set_attach_point_from_current_auto_joint()
+        self._on_custom_item_setting_changed()
+
+    def _on_custom_attach_slider_changed(self) -> None:
+        if not self.custom_syncing_ui:
+            self.custom_item_attach_mode_var.set(CUSTOM_ATTACH_FIXED)
+        self._on_custom_item_setting_changed()
+
     def _on_custom_selection_changed(self, _event: tk.Event | None = None) -> None:
         selection = self.custom_listbox.curselection()
         if not selection:
+            self.custom_selected_ids.clear()
             return
-        index = int(selection[0])
         choices = self._custom_asset_choices()
-        if 0 <= index < len(choices):
-            self.custom_selected_id.set(choices[index].asset_id)
-            self._load_selected_custom_asset_to_editor()
+        selected_indices = [int(index) for index in selection if 0 <= int(index) < len(choices)]
+        self.custom_selected_ids = {choices[index].asset_id for index in selected_indices}
+        active_index = self.custom_listbox.index("active")
+        if active_index not in selected_indices:
+            active_index = selected_indices[-1]
+        if 0 <= active_index < len(choices):
+            self.custom_selected_id.set(choices[active_index].asset_id)
+        self._load_selected_custom_asset_to_editor()
 
     def _uploaded_custom_asset_index(self, asset_id: str) -> int | None:
         for index, asset in enumerate(self.custom_assets):
@@ -2312,6 +2531,7 @@ class PigPointerApp:
             return
         self.custom_assets[index], self.custom_assets[new_index] = self.custom_assets[new_index], self.custom_assets[index]
         self.custom_selected_id.set(asset.asset_id)
+        self.custom_selected_ids = {asset.asset_id}
         if self.running:
             self._place_custom_physics_at_cursor()
         self._refresh_custom_panel()
@@ -2333,6 +2553,7 @@ class PigPointerApp:
             asset.enabled = False
         self.custom_include_pig_var.set(False)
         self.custom_selected_id.set(self.custom_assets[0].asset_id if self.custom_assets else "")
+        self.custom_selected_ids = {self.custom_selected_id.get()} if self.custom_selected_id.get() else set()
         if self.running:
             self.custom_states.clear()
         self._refresh_custom_panel()
@@ -2355,6 +2576,7 @@ class PigPointerApp:
             self.custom_renderers.pop(asset_id, None)
             self.custom_states.pop(asset_id, None)
         self.custom_selected_id.set(DEFAULT_PIG_CUSTOM_ID if self.custom_include_pig_var.get() else "")
+        self.custom_selected_ids = {self.custom_selected_id.get()} if self.custom_selected_id.get() else set()
         self._refresh_custom_panel()
         self._schedule_save_settings()
 
@@ -2377,15 +2599,33 @@ class PigPointerApp:
             self._on_custom_connection_changed()
         self._on_custom_item_setting_changed()
 
+    def _set_attach_point_from_current_auto_joint(self) -> None:
+        asset = self._selected_custom_asset()
+        if asset is None or asset.asset_id == DEFAULT_PIG_CUSTOM_ID:
+            return
+        renderer = self._custom_renderer(asset)
+        if renderer is None or not renderer.frames:
+            return
+        frame = renderer.frames[0]
+        joint = renderer.joints[0]
+        if frame.width <= 0 or frame.height <= 0:
+            return
+        self.custom_item_attach_x_var.set(_clamp(joint[0] / frame.width * 100.0, 0, 100, 50))
+        self.custom_item_attach_y_var.set(_clamp(joint[1] / frame.height * 100.0, 0, 100, 0))
+
     def _on_custom_item_setting_changed(self) -> None:
         if self.custom_syncing_ui:
             return
         asset = self._selected_custom_asset()
         if asset is None:
             return
-        if asset.asset_id == DEFAULT_PIG_CUSTOM_ID:
+        selected_assets = self._selected_custom_assets() or [asset]
+        update_default_pig = any(item.asset_id == DEFAULT_PIG_CUSTOM_ID for item in selected_assets)
+
+        if update_default_pig:
             self.size_var.set(_clamp(self.custom_item_size_var.get(), 70, 260, 150))
             self.rope_length_var.set(_clamp(self.custom_item_rope_length_var.get(), 36, 160, 72))
+            self.rope_width_var.set(_clamp(self.custom_item_rope_width_var.get(), 1, 12, 4))
             self.anim_speed_var.set(_clamp(self.custom_item_anim_speed_var.get(), 0.5, 3.0, 1.6))
             self.prob_var.set(_clamp(self.custom_item_probability_var.get(), 0, 100, 15))
             self.weight_var.set(_clamp(self.custom_item_weight_var.get(), 0, 100, 70))
@@ -2393,19 +2633,32 @@ class PigPointerApp:
             self.custom_pig_rope_color_var.set(rope_color if rope_color in ROPE_COLORS else "棕色")
             self.custom_include_pig_var.set(self.custom_item_enabled_var.get())
             self._sync_slider_labels()
-            self._refresh_custom_asset_list()
-            self._sync_custom_status()
-            self._schedule_save_settings()
-            return
-        asset.enabled = self.custom_item_enabled_var.get()
-        asset.size = _clamp(self.custom_item_size_var.get(), 36, 320, 130)
-        asset.rope_length = _clamp(self.custom_item_rope_length_var.get(), 20, 260, 72)
-        asset.rope_color = self.custom_item_rope_color_var.get() if self.custom_item_rope_color_var.get() in ROPE_COLORS else "棕色"
-        asset.anim_speed = _clamp(self.custom_item_anim_speed_var.get(), 0.2, 4.0, 1.0)
-        asset.probability = _clamp(self.custom_item_probability_var.get(), 0, 100, 10)
-        asset.collision_radius = _clamp(self.custom_item_collision_var.get(), 8, 180, 46)
-        asset.weight = _clamp(self.custom_item_weight_var.get(), 0, 100, 70)
-        asset.reverse_loop = self.custom_item_reverse_loop_var.get()
+
+        for target in selected_assets:
+            if target.asset_id == DEFAULT_PIG_CUSTOM_ID:
+                continue
+            target.enabled = self.custom_item_enabled_var.get()
+            target.size = _clamp(self.custom_item_size_var.get(), 36, 320, 130)
+            target.rope_length = _clamp(self.custom_item_rope_length_var.get(), 20, 260, 72)
+            target.rope_color = self.custom_item_rope_color_var.get() if self.custom_item_rope_color_var.get() in ROPE_COLORS else "棕色"
+            target.anim_speed = _clamp(self.custom_item_anim_speed_var.get(), 0.2, 4.0, 1.0)
+            target.probability = _clamp(self.custom_item_probability_var.get(), 0, 100, 10)
+            target.collision_radius = _clamp(self.custom_item_collision_var.get(), 8, 180, 46)
+            target.weight = _clamp(self.custom_item_weight_var.get(), 0, 100, 70)
+            target.reverse_loop = self.custom_item_reverse_loop_var.get()
+            target.always_animate = self.custom_item_always_animate_var.get()
+            target.rope_width = _clamp(self.custom_item_rope_width_var.get(), 1, 12, 3)
+            old_attach = (target.attach_mode, round(target.attach_x, 2), round(target.attach_y, 2))
+            attach_mode = self.custom_item_attach_mode_var.get()
+            target.attach_mode = attach_mode if attach_mode in CUSTOM_ATTACH_MODES else CUSTOM_ATTACH_AUTO
+            target.attach_x = _clamp(self.custom_item_attach_x_var.get(), 0, 100, 50)
+            target.attach_y = _clamp(self.custom_item_attach_y_var.get(), 0, 100, 0)
+            new_attach = (target.attach_mode, round(target.attach_x, 2), round(target.attach_y, 2))
+            if old_attach != new_attach:
+                self._clear_custom_renderer_cache(target.asset_id)
+
+        if self.running:
+            self._place_custom_physics_at_cursor()
         self._sync_custom_editor_labels()
         self._refresh_custom_asset_list()
         self._sync_custom_status()
@@ -2427,9 +2680,10 @@ class PigPointerApp:
                 self.custom_pig_rope_color_var.set("自定义")
                 self._on_custom_item_setting_changed()
                 return
-            asset.custom_rope_color = color
+            for target in self._selected_custom_assets() or [asset]:
+                if target.asset_id != DEFAULT_PIG_CUSTOM_ID:
+                    target.custom_rope_color = color
             self.custom_item_rope_color_var.set("自定义")
-            asset.rope_color = "自定义"
             self._on_custom_item_setting_changed()
 
     def _choose_custom_assets_dir(self) -> None:
@@ -2553,9 +2807,12 @@ class PigPointerApp:
                     probability=float(self.prob_var.get()),
                     anim_speed=float(self.anim_speed_var.get()),
                     weight=float(self.weight_var.get()),
+                    rope_width=float(self.rope_width_var.get()),
+                    always_animate=source.suffix.lower() == ".gif",
                 )
             )
             self.custom_selected_id.set(asset_id)
+            self.custom_selected_ids = {asset_id}
             added += 1
         if skipped and not added:
             messagebox.showinfo("没有添加素材", "请选择 gif、png、jpg、jpeg、webp 或 bmp 文件。")
@@ -2569,6 +2826,7 @@ class PigPointerApp:
         if asset.asset_id == DEFAULT_PIG_CUSTOM_ID:
             self.custom_include_pig_var.set(False)
             self.custom_selected_id.set(self.custom_assets[0].asset_id if self.custom_assets else "")
+            self.custom_selected_ids = {self.custom_selected_id.get()} if self.custom_selected_id.get() else set()
             self.custom_states.pop(DEFAULT_PIG_CUSTOM_ID, None)
             self._refresh_custom_panel()
             self._schedule_save_settings()
@@ -2578,8 +2836,10 @@ class PigPointerApp:
         self.custom_states.pop(asset.asset_id, None)
         if self.custom_assets:
             self.custom_selected_id.set(self.custom_assets[0].asset_id)
+            self.custom_selected_ids = {self.custom_assets[0].asset_id}
         else:
             self.custom_selected_id.set("")
+            self.custom_selected_ids.clear()
         self._refresh_custom_panel()
         self._schedule_save_settings()
 
@@ -2622,6 +2882,7 @@ class PigPointerApp:
         self.trigger_interval_var.set(DEFAULT_GLOBAL_SETTINGS["trigger_interval"])
         self.weight_var.set(DEFAULT_GLOBAL_SETTINGS["weight"])
         self.rope_length_var.set(DEFAULT_GLOBAL_SETTINGS["rope_length"])
+        self.rope_width_var.set(DEFAULT_GLOBAL_SETTINGS["rope_width"])
         self.performance_mode_var.set(DEFAULT_GLOBAL_SETTINGS["performance_mode"])
         self.absolute_binding_var.set(DEFAULT_GLOBAL_SETTINGS["absolute_binding"])
         self.background_var.set(DEFAULT_GLOBAL_SETTINGS["background"])
@@ -2649,6 +2910,11 @@ class PigPointerApp:
             asset.collision_radius = float(DEFAULT_CUSTOM_ASSET_SETTINGS["collision_radius"])
             asset.weight = float(DEFAULT_CUSTOM_ASSET_SETTINGS["weight"])
             asset.reverse_loop = bool(DEFAULT_CUSTOM_ASSET_SETTINGS["reverse_loop"])
+            asset.attach_mode = str(DEFAULT_CUSTOM_ASSET_SETTINGS["attach_mode"])
+            asset.attach_x = float(DEFAULT_CUSTOM_ASSET_SETTINGS["attach_x"])
+            asset.attach_y = float(DEFAULT_CUSTOM_ASSET_SETTINGS["attach_y"])
+            asset.always_animate = bool(DEFAULT_CUSTOM_ASSET_SETTINGS["always_animate"])
+            asset.rope_width = float(DEFAULT_CUSTOM_ASSET_SETTINGS["rope_width"])
 
         self.custom_selected_id.set(self.custom_assets[0].asset_id if self.custom_assets else "")
         self.animation_active = False
@@ -2883,6 +3149,23 @@ class PigPointerApp:
             pass
         return int(window.winfo_id())
 
+    def _disable_maximize_button(self) -> None:
+        if sys.platform != "win32":
+            return
+        try:
+            hwnd = self._window_frame_handle(self.root)
+            user32 = ctypes.windll.user32
+            user32.GetWindowLongW.argtypes = [wintypes.HWND, ctypes.c_int]
+            user32.GetWindowLongW.restype = wintypes.LONG
+            user32.SetWindowLongW.argtypes = [wintypes.HWND, ctypes.c_int, wintypes.LONG]
+            user32.SetWindowLongW.restype = wintypes.LONG
+            style = user32.GetWindowLongW(hwnd, GWL_STYLE)
+            if style & WS_MAXIMIZEBOX:
+                user32.SetWindowLongW(hwnd, GWL_STYLE, style & ~WS_MAXIMIZEBOX)
+                self.root.update_idletasks()
+        except Exception:
+            pass
+
     def _refresh_taskbar_icon(self) -> None:
         try:
             if self.root.winfo_exists():
@@ -2931,8 +3214,7 @@ class PigPointerApp:
             balloon_start = max(0.0, min(1.0, (0.5 - weight) * 2.0))
             direction = 1.0 - 2.0 * balloon_start
             if self.custom_connection_var.get() == CUSTOM_CONNECTION_MOUSE:
-                spread = (index - 0.5 * max(0, len(self._active_custom_assets()) - 1)) * 18.0
-                item_anchor_x = anchor_x + spread
+                item_anchor_x = anchor_x
                 item_anchor_y = anchor_y
             else:
                 item_anchor_x = previous_x
@@ -3041,12 +3323,15 @@ class PigPointerApp:
         for asset in self._active_custom_assets():
             state = self.custom_states.setdefault(asset.asset_id, CustomItemState())
             frame_count = self._custom_asset_frame_count(asset)
-            if frame_count <= 1 or asset.probability <= 0:
+            if frame_count <= 1 or (asset.probability <= 0 and not asset.always_animate):
                 state.animation_active = False
                 state.frame_index = 0
                 state.frame_time_ms = 0.0
                 state.trigger_timer = 0.0
                 continue
+            if asset.always_animate:
+                state.animation_active = True
+                state.trigger_timer = 0.0
             if not state.animation_active:
                 state.frame_index = 0
                 state.frame_time_ms = 0.0
@@ -3157,15 +3442,13 @@ class PigPointerApp:
 
         previous_x, previous_y = anchor_x, anchor_y
         previous_vx, previous_vy = cursor_vx, cursor_vy
-        mouse_count = len(active_assets)
         for index, asset in enumerate(active_assets):
             state = self.custom_states.setdefault(asset.asset_id, CustomItemState())
             if state.x == 0.0 and state.y == 0.0:
                 state.x = previous_x
                 state.y = previous_y + asset.rope_length
             if self.custom_connection_var.get() == CUSTOM_CONNECTION_MOUSE:
-                spread = (index - 0.5 * max(0, mouse_count - 1)) * 18.0
-                item_anchor_x = anchor_x + spread
+                item_anchor_x = anchor_x
                 item_anchor_y = anchor_y
                 item_anchor_vx = cursor_vx
                 item_anchor_vy = cursor_vy
@@ -3374,7 +3657,7 @@ class PigPointerApp:
             x = inv * inv * (anchor_x - left) + 2 * inv * t * control_x + t * t * (self.rope_end_x - left)
             y = inv * inv * (anchor_y - top) + 2 * inv * t * control_y + t * t * (self.rope_end_y - top)
             points.append((x, y))
-        draw.line(points, fill=(116, 77, 45, 245), width=max(2, int(display_height * 0.028)), joint="curve")
+        draw.line(points, fill=(116, 77, 45, 245), width=max(1, int(round(self.rope_width_var.get()))), joint="curve")
         composite.alpha_composite(image, (int(round(image_x - left)), int(round(image_y - top))))
         if absolute_binding and cursor_asset is not None:
             cursor_image, cursor_hotspot = cursor_asset
@@ -3474,7 +3757,7 @@ class PigPointerApp:
                 x = inv * inv * (state.anchor_x - left) + 2 * inv * t * control_x + t * t * (state.x - left)
                 y = inv * inv * (state.anchor_y - top) + 2 * inv * t * control_y + t * t * (state.y - top)
                 points.append((x, y))
-            draw.line(points, fill=self._custom_rope_rgba(config), width=max(2, int(config.size * 0.026)), joint="curve")
+            draw.line(points, fill=self._custom_rope_rgba(config), width=max(1, int(round(config.rope_width))), joint="curve")
 
         for item in rendered_items:
             composite.alpha_composite(item.image, (int(round(item.image_x - left)), int(round(item.image_y - top))))
@@ -3517,7 +3800,16 @@ class PigPointerApp:
         renderer = self._custom_renderer(asset)
         if renderer is None:
             return None
-        return renderer.render_asset(frame_index, display_height, angle, asset.reverse_loop, angle_step)
+        return renderer.render_asset(
+            frame_index,
+            display_height,
+            angle,
+            asset.reverse_loop,
+            angle_step=angle_step,
+            attach_mode=asset.attach_mode,
+            attach_x=asset.attach_x,
+            attach_y=asset.attach_y,
+        )
 
     def _render_custom_preview_asset(
         self,
@@ -3531,7 +3823,15 @@ class PigPointerApp:
         renderer = self._custom_renderer(asset)
         if renderer is None:
             return None
-        return renderer.render(frame_index, display_height, angle, asset.reverse_loop)
+        return renderer.render(
+            frame_index,
+            display_height,
+            angle,
+            asset.reverse_loop,
+            attach_mode=asset.attach_mode,
+            attach_x=asset.attach_x,
+            attach_y=asset.attach_y,
+        )
 
     def _draw_cursor_only_overlay(self) -> None:
         if self.overlay is None:
@@ -3580,6 +3880,11 @@ class PigPointerApp:
         self.custom_renderers[asset.asset_id] = renderer
         return renderer
 
+    def _clear_custom_renderer_cache(self, asset_id: str) -> None:
+        renderer = self.custom_renderers.get(asset_id)
+        if renderer is not None:
+            renderer.clear_cache()
+
     @staticmethod
     def _cursor_polygon(pointer_x: float, pointer_y: float) -> list[tuple[float, float]]:
         return [
@@ -3617,11 +3922,34 @@ class PigPointerApp:
         draw.polygon(outline_points, fill=(20, 20, 20, 255))
         draw.polygon(cursor_points, fill=(255, 255, 255, 255))
 
+    def _hide_preview_attach_marker(self) -> None:
+        self.custom_preview_bounds = None
+        if self.preview_attach_marker is not None:
+            self.preview.itemconfigure(self.preview_attach_marker, state="hidden")
+
+    def _on_preview_attach_drag(self, event: tk.Event) -> None:
+        if not self.custom_mode_var.get() or self.custom_preview_bounds is None:
+            return
+        asset = self._selected_custom_asset()
+        if asset is None or asset.asset_id == DEFAULT_PIG_CUSTOM_ID:
+            return
+        asset_id, image_x, image_y, image_width, image_height = self.custom_preview_bounds
+        if asset.asset_id != asset_id or image_width <= 1 or image_height <= 1:
+            return
+        local_x = _clamp(event.x - image_x, 0, image_width, image_width / 2)
+        local_y = _clamp(event.y - image_y, 0, image_height, 0)
+        self.custom_item_attach_mode_var.set(CUSTOM_ATTACH_FIXED)
+        self.custom_item_attach_x_var.set(local_x / image_width * 100.0)
+        self.custom_item_attach_y_var.set(local_y / image_height * 100.0)
+        self._on_custom_item_setting_changed()
+        self._draw_preview(time.perf_counter())
+
     def _draw_preview(self, now: float) -> None:
-        width = int(self.preview["width"])
+        width = max(1, self.preview.winfo_width() or int(self.preview["width"]))
         if self.custom_mode_var.get():
             self._draw_custom_preview(now, width)
             return
+        self._hide_preview_attach_marker()
         preview_height = int(max(52, min(112, self.size_var.get() * 0.55)))
         sway = math.sin(now * 2.2) * 8.0
         angle = sway * 0.85
@@ -3646,6 +3974,7 @@ class PigPointerApp:
             rope_end_y,
         )
         self.preview.coords(self.preview_image, rope_end_x - joint[0], rope_end_y - joint[1])
+        self.preview.itemconfigure(self.preview_rope, width=max(1, int(round(self.rope_width_var.get()))))
         self.preview.itemconfigure(self.preview_image, image=photo)
 
     def _draw_custom_preview(self, now: float, width: int) -> None:
@@ -3654,26 +3983,29 @@ class PigPointerApp:
             self.preview.coords(self.preview_anchor, width / 2 - 5, 17, width / 2 + 5, 27)
             self.preview.coords(self.preview_anchor_ring, width / 2 - 9, 16, width / 2 + 9, 34)
             self.preview.coords(self.preview_rope, width / 2, 25, width / 2, 70)
-            self.preview.itemconfigure(self.preview_rope, fill="#744d2d")
+            self.preview.itemconfigure(self.preview_rope, fill="#744d2d", width=3)
             self.preview.itemconfigure(self.preview_image, image="")
+            self._hide_preview_attach_marker()
             return
         preview_height = int(max(42, min(112, asset.size * 0.55)))
         frame_count = self._custom_asset_frame_count(asset)
-        if frame_count > 1 and asset.probability > 0:
+        if frame_count > 1 and (asset.probability > 0 or asset.always_animate):
             frame_index = int(now * 1000 / max(24, self._custom_asset_duration(asset, 0)) * max(0.2, asset.anim_speed)) % frame_count
         else:
             frame_index = 0
-        sway = math.sin(now * 2.2) * 8.0
-        rendered = self._render_custom_preview_asset(asset, frame_index, preview_height, sway * 0.85)
+        rendered = self._render_custom_preview_asset(asset, frame_index, preview_height, 0.0)
         if rendered is None:
             self.preview.itemconfigure(self.preview_image, image="")
+            self._hide_preview_attach_marker()
             return
         photo, joint = rendered
         self.custom_preview_photo = photo
         anchor_x = width / 2
         anchor_y = 22
-        rope_end_x = anchor_x + math.sin(now * 1.7) * 12
-        rope_end_y = anchor_y + asset.rope_length * 0.52
+        image_x = (width - photo.width()) / 2
+        image_y = max(34.0, min(148.0 - photo.height(), anchor_y + 42.0))
+        rope_end_x = image_x + joint[0]
+        rope_end_y = image_y + joint[1]
         self.preview.coords(self.preview_anchor, anchor_x - 5, anchor_y - 5, anchor_x + 5, anchor_y + 5)
         self.preview.coords(self.preview_anchor_ring, anchor_x - 9, anchor_y - 9, anchor_x + 9, anchor_y + 9)
         self.preview.coords(
@@ -3686,9 +4018,21 @@ class PigPointerApp:
             rope_end_y,
         )
         rgba = self._custom_rope_rgba(asset)
-        self.preview.itemconfigure(self.preview_rope, fill=f"#{rgba[0]:02x}{rgba[1]:02x}{rgba[2]:02x}")
-        self.preview.coords(self.preview_image, rope_end_x - joint[0], rope_end_y - joint[1])
+        self.preview.itemconfigure(
+            self.preview_rope,
+            fill=f"#{rgba[0]:02x}{rgba[1]:02x}{rgba[2]:02x}",
+            width=max(1, int(round(asset.rope_width))),
+        )
+        self.preview.coords(self.preview_image, image_x, image_y)
         self.preview.itemconfigure(self.preview_image, image=photo)
+        self.custom_preview_bounds = (asset.asset_id, image_x, image_y, float(photo.width()), float(photo.height()))
+        if self.preview_attach_marker is not None and asset.asset_id != DEFAULT_PIG_CUSTOM_ID:
+            self.preview.coords(self.preview_attach_marker, rope_end_x - 4, rope_end_y - 4, rope_end_x + 4, rope_end_y + 4)
+            marker_fill = "#e53935" if asset.attach_mode == CUSTOM_ATTACH_FIXED else "#f0a22e"
+            self.preview.itemconfigure(self.preview_attach_marker, fill=marker_fill, state="normal")
+            self.preview.tag_raise(self.preview_attach_marker)
+        else:
+            self._hide_preview_attach_marker()
 
 
 def main() -> None:
