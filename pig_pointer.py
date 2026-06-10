@@ -223,6 +223,14 @@ class CustomAssetConfig:
     attach_y: float = 0.0
     always_animate: bool = False
     rope_width: float = 3.0
+    source_width: int = 0
+    source_height: int = 0
+    trimmed_width: int = 0
+    trimmed_height: int = 0
+    frame_count: int = 1
+    file_size: int = 0
+    estimated_pixels: int = 0
+    is_animated: bool = False
 
     @classmethod
     def from_dict(cls, data: object) -> "CustomAssetConfig | None":
@@ -246,6 +254,9 @@ class CustomAssetConfig:
         attach_mode = data.get("attach_mode")
         if not isinstance(attach_mode, str) or attach_mode not in CUSTOM_ATTACH_MODES:
             attach_mode = CUSTOM_ATTACH_AUTO
+        frame_count = _clamp_int(data.get("frame_count"), 1, 20_000, 1)
+        is_animated_value = data.get("is_animated")
+        is_animated = is_animated_value if isinstance(is_animated_value, bool) else frame_count > 1 or str(path).lower().endswith(".gif")
         return cls(
             asset_id=asset_id,
             name=name,
@@ -265,6 +276,14 @@ class CustomAssetConfig:
             attach_y=_clamp(data.get("attach_y"), 0, 100, 0),
             always_animate=bool(data.get("always_animate", str(path).lower().endswith(".gif"))),
             rope_width=_clamp(data.get("rope_width"), 1, 12, 3),
+            source_width=_clamp_int(data.get("source_width"), 0, 100_000),
+            source_height=_clamp_int(data.get("source_height"), 0, 100_000),
+            trimmed_width=_clamp_int(data.get("trimmed_width"), 0, 100_000),
+            trimmed_height=_clamp_int(data.get("trimmed_height"), 0, 100_000),
+            frame_count=frame_count,
+            file_size=_clamp_int(data.get("file_size"), 0, 2_000_000_000),
+            estimated_pixels=_clamp_int(data.get("estimated_pixels"), 0, 20_000_000_000),
+            is_animated=is_animated,
         )
 
     def to_dict(self) -> dict[str, object]:
@@ -287,6 +306,14 @@ class CustomAssetConfig:
             "attach_y": self.attach_y,
             "always_animate": self.always_animate,
             "rope_width": self.rope_width,
+            "source_width": self.source_width,
+            "source_height": self.source_height,
+            "trimmed_width": self.trimmed_width,
+            "trimmed_height": self.trimmed_height,
+            "frame_count": self.frame_count,
+            "file_size": self.file_size,
+            "estimated_pixels": self.estimated_pixels,
+            "is_animated": self.is_animated,
         }
 
 
@@ -322,6 +349,15 @@ class PerformanceProfile:
     angle_step: int
     texture_cache_limit: int
     high_resolution_timer: bool
+    adaptive: bool = False
+    idle_fps: int = 18
+    animation_fps: int = 30
+
+
+SMART_PERFORMANCE_MODE = "智能性能"
+PERFORMANCE_MODE_ALIASES = {
+    "低性能": SMART_PERFORMANCE_MODE,
+}
 
 
 PERFORMANCE_PROFILES = {
@@ -337,17 +373,25 @@ PERFORMANCE_PROFILES = {
         texture_cache_limit=520,
         high_resolution_timer=True,
     ),
-    "低性能": PerformanceProfile(
-        target_fps=30,
+    SMART_PERFORMANCE_MODE: PerformanceProfile(
+        target_fps=60,
         angle_step=4,
-        texture_cache_limit=180,
+        texture_cache_limit=260,
         high_resolution_timer=False,
+        adaptive=True,
+        idle_fps=18,
+        animation_fps=30,
     ),
 }
 
 
+def _normalize_performance_mode(mode: str) -> str:
+    return PERFORMANCE_MODE_ALIASES.get(mode, mode)
+
+
 def _performance_profile(mode: str) -> PerformanceProfile:
-    return PERFORMANCE_PROFILES.get(mode, PERFORMANCE_PROFILES["普通"])
+    normalized_mode = _normalize_performance_mode(mode)
+    return PERFORMANCE_PROFILES.get(normalized_mode, PERFORMANCE_PROFILES["普通"])
 
 
 def _enable_dpi_awareness() -> None:
@@ -431,6 +475,14 @@ def _set_startup_enabled(enabled: bool) -> None:
 def _clamp(value: object, minimum: float, maximum: float, default: float) -> float:
     try:
         number = float(value)
+    except (TypeError, ValueError):
+        return default
+    return max(minimum, min(maximum, number))
+
+
+def _clamp_int(value: object, minimum: int, maximum: int, default: int = 0) -> int:
+    try:
+        number = int(value)
     except (TypeError, ValueError):
         return default
     return max(minimum, min(maximum, number))
@@ -1362,6 +1414,10 @@ class CustomAssetRenderer:
         self.durations: list[int] = []
         self.joints: list[tuple[float, float]] = []
         self.base_size = (1, 1)
+        self.source_size = (1, 1)
+        self.source_frame_count = 1
+        self.file_size = 0
+        self.estimated_pixels = 1
         self._cache: OrderedDict[tuple[object, ...], tuple[Image.Image, tuple[float, float], bytes]] = OrderedDict()
         self._photo_cache: OrderedDict[tuple[object, ...], tuple[ImageTk.PhotoImage, tuple[float, float]]] = OrderedDict()
         self.cache_limit = 160
@@ -1369,6 +1425,12 @@ class CustomAssetRenderer:
 
     def _load(self) -> None:
         source = Image.open(self.asset_path)
+        self.source_size = source.size
+        self.source_frame_count = max(1, int(getattr(source, "n_frames", 1) or 1))
+        try:
+            self.file_size = self.asset_path.stat().st_size
+        except OSError:
+            self.file_size = 0
         raw_frames = [frame.convert("RGBA") for frame in ImageSequence.Iterator(source)]
         if not raw_frames:
             raw_frames = [source.convert("RGBA")]
@@ -1386,6 +1448,7 @@ class CustomAssetRenderer:
         if len(self.durations) != len(self.frames):
             self.durations = [40] * len(self.frames)
         self.base_size = self.frames[0].size
+        self.estimated_pixels = int(self.base_size[0] * self.base_size[1] * max(1, len(self.frames)))
 
     @staticmethod
     def _find_attach_joint(frame: Image.Image) -> tuple[float, float]:
@@ -1582,6 +1645,7 @@ class PigPointerApp:
         self.custom_color_swatch: tk.Canvas | None = None
         self.custom_color_swatch_rect: int | None = None
         self.custom_status_label: ttk.Label | None = None
+        self.custom_animation_controls: list[tk.Widget] = []
         self.preview_attach_marker: int | None = None
         self.size_text = tk.StringVar()
         self.prob_text = tk.StringVar()
@@ -1596,6 +1660,19 @@ class PigPointerApp:
         self.frame_index = 0
         self.frame_time_ms = 0.0
         self.last_tick = time.perf_counter()
+        self.last_overlay_draw_time = 0.0
+        self.overlay_dirty = True
+        self.composite_canvas: Image.Image | None = None
+        self.average_draw_ms = 0.0
+        self.last_draw_ms = 0.0
+        self.average_physics_ms = 0.0
+        self.last_physics_ms = 0.0
+        self.average_collision_ms = 0.0
+        self.last_collision_ms = 0.0
+        self.collision_accumulator = 0.0
+        self.custom_prewarm_jobs: list[tuple[str, int, int, int]] = []
+        self.custom_prewarm_signature: tuple[object, ...] | None = None
+        self.last_custom_prewarm_time = 0.0
         self.animation_active = False
         self.trigger_timer = 0.0
         self.prewarm_jobs: list[tuple[int, int, int]] = []
@@ -1721,7 +1798,7 @@ class PigPointerApp:
         ttk.Label(performance_row, text="性能模式").pack(side="left")
         performance_options = ttk.Frame(performance_row)
         performance_options.pack(side="right")
-        for mode in ("高性能", "普通", "低性能"):
+        for mode in ("高性能", "普通", SMART_PERFORMANCE_MODE):
             ttk.Radiobutton(
                 performance_options,
                 text=mode,
@@ -1820,19 +1897,21 @@ class PigPointerApp:
         maximum: int | float,
         label_var: tk.StringVar,
         command: Callable[[], None] | None = None,
-    ) -> None:
+    ) -> ttk.Scale:
         row = ttk.Frame(parent)
         row.pack(fill="x", pady=(8, 0))
         ttk.Label(row, text=title).pack(side="left")
         ttk.Label(row, textvariable=label_var, foreground="#6c625c").pack(side="right")
         change_command = command or self._on_custom_item_setting_changed
-        ttk.Scale(
+        scale = ttk.Scale(
             parent,
             variable=variable,
             from_=minimum,
             to=maximum,
             command=lambda _value: change_command(),
-        ).pack(fill="x")
+        )
+        scale.pack(fill="x")
+        return scale
 
     def _build_custom_attach_panel(self, parent: ttk.Frame) -> None:
         ttk.Label(parent, text="连接点校准", foreground="#5b4636").pack(anchor="w")
@@ -2004,7 +2083,7 @@ class PigPointerApp:
             command=self._choose_custom_rope_color,
         )
         self.custom_color_button.pack(fill="x", pady=(6, 0))
-        self._add_custom_slider(
+        self.custom_anim_speed_scale = self._add_custom_slider(
             self.custom_editor,
             "动画播放速度",
             self.custom_item_anim_speed_var,
@@ -2012,7 +2091,7 @@ class PigPointerApp:
             4.0,
             self.custom_item_anim_speed_text,
         )
-        self._add_custom_slider(
+        self.custom_probability_scale = self._add_custom_slider(
             self.custom_editor,
             "动画触发概率",
             self.custom_item_probability_var,
@@ -2036,18 +2115,26 @@ class PigPointerApp:
             100,
             self.custom_item_weight_text,
         )
-        ttk.Checkbutton(
+        self.custom_always_animate_check = ttk.Checkbutton(
             self.custom_editor,
-            text="GIF 连续播放",
+            text="动画连续播放",
             variable=self.custom_item_always_animate_var,
             command=self._on_custom_item_setting_changed,
-        ).pack(anchor="w", pady=(8, 0))
-        ttk.Checkbutton(
+        )
+        self.custom_always_animate_check.pack(anchor="w", pady=(8, 0))
+        self.custom_reverse_loop_check = ttk.Checkbutton(
             self.custom_editor,
-            text="GIF 往返循环",
+            text="动画往返循环",
             variable=self.custom_item_reverse_loop_var,
             command=self._on_custom_item_setting_changed,
-        ).pack(anchor="w", pady=(4, 0))
+        )
+        self.custom_reverse_loop_check.pack(anchor="w", pady=(4, 0))
+        self.custom_animation_controls = [
+            self.custom_anim_speed_scale,
+            self.custom_probability_scale,
+            self.custom_always_animate_check,
+            self.custom_reverse_loop_check,
+        ]
         self.custom_global_section = ttk.Frame(parent)
         self.custom_global_section.pack(fill="x", pady=(10, 0))
         ttk.Label(self.custom_global_section, text="全局设置", foreground="#5b4636").pack(anchor="w")
@@ -2114,7 +2201,10 @@ class PigPointerApp:
 
     def _setting_mode(self, name: str, default: str) -> str:
         value = self.settings.get(name)
-        return value if isinstance(value, str) and value in PERFORMANCE_PROFILES else default
+        if not isinstance(value, str):
+            return default
+        normalized_value = _normalize_performance_mode(value)
+        return normalized_value if normalized_value in PERFORMANCE_PROFILES else default
 
     def _setting_connection_mode(self, name: str, default: str) -> str:
         value = self.settings.get(name)
@@ -2147,14 +2237,54 @@ class PigPointerApp:
             if asset.asset_id in seen_ids:
                 asset.asset_id = uuid.uuid4().hex
             seen_ids.add(asset.asset_id)
+            self._refresh_custom_asset_stats(asset)
             assets.append(asset)
         return assets
+
+    def _refresh_custom_asset_stats(self, asset: CustomAssetConfig, renderer: CustomAssetRenderer | None = None) -> None:
+        path = Path(asset.path).expanduser()
+        if not path.exists():
+            return
+        if renderer is not None:
+            asset.source_width = int(renderer.source_size[0])
+            asset.source_height = int(renderer.source_size[1])
+            asset.trimmed_width = int(renderer.base_size[0])
+            asset.trimmed_height = int(renderer.base_size[1])
+            asset.frame_count = int(max(1, renderer.source_frame_count))
+            asset.file_size = int(renderer.file_size)
+            asset.estimated_pixels = int(renderer.estimated_pixels)
+            asset.is_animated = asset.frame_count > 1
+            return
+        try:
+            with Image.open(path) as source:
+                source_width, source_height = source.size
+                frame_count = max(1, int(getattr(source, "n_frames", 1) or 1))
+            file_size = path.stat().st_size
+        except Exception:
+            return
+
+        if renderer is not None and renderer.base_size != (1, 1):
+            trimmed_width, trimmed_height = renderer.base_size
+            frame_count = max(frame_count, len(renderer.frames))
+        else:
+            trimmed_width = asset.trimmed_width or source_width
+            trimmed_height = asset.trimmed_height or source_height
+
+        asset.source_width = int(source_width)
+        asset.source_height = int(source_height)
+        asset.trimmed_width = int(trimmed_width)
+        asset.trimmed_height = int(trimmed_height)
+        asset.frame_count = int(frame_count)
+        asset.file_size = int(file_size)
+        asset.estimated_pixels = int(max(1, trimmed_width) * max(1, trimmed_height) * max(1, frame_count))
+        asset.is_animated = asset.frame_count > 1
 
     def _on_setting_changed(self) -> None:
         self._sync_slider_labels()
         self._schedule_save_settings()
 
     def _schedule_save_settings(self) -> None:
+        self.overlay_dirty = True
         if self.save_after_id is not None:
             try:
                 self.root.after_cancel(self.save_after_id)
@@ -2207,9 +2337,11 @@ class PigPointerApp:
         self.renderer.cache_limit = self._current_performance_profile().texture_cache_limit
         self._sync_custom_editor_labels()
         self._sync_custom_assets_dir_text()
-        custom_cache_limit = max(32, self._current_performance_profile().texture_cache_limit // max(2, len(self.custom_renderers) or 2))
-        for renderer in self.custom_renderers.values():
-            renderer.cache_limit = custom_cache_limit
+        assets_by_id = {asset.asset_id: asset for asset in self._custom_asset_choices()}
+        for asset_id, renderer in self.custom_renderers.items():
+            asset = assets_by_id.get(asset_id)
+            if asset is not None:
+                renderer.cache_limit = self._custom_renderer_cache_limit(asset)
 
     def _sync_custom_editor_labels(self) -> None:
         self.custom_item_size_text.set(f"{int(self.custom_item_size_var.get())} px")
@@ -2227,6 +2359,7 @@ class PigPointerApp:
         except AttributeError:
             pass
         self._sync_custom_color_swatch()
+        self._sync_custom_animation_controls()
         self._sync_custom_status_wrap()
 
     def _on_custom_panel_configure(self, event: tk.Event) -> None:
@@ -2277,6 +2410,7 @@ class PigPointerApp:
             weight=float(self.weight_var.get()),
             reverse_loop=True,
             rope_width=float(self.rope_width_var.get()),
+            is_animated=True,
         )
 
     def _custom_asset_choices(self) -> list[CustomAssetConfig]:
@@ -2310,6 +2444,22 @@ class PigPointerApp:
         choices = self._custom_asset_choices()
         return [asset for asset in choices if asset.asset_id in selected_ids]
 
+    @staticmethod
+    def _custom_asset_is_animated(asset: CustomAssetConfig) -> bool:
+        return asset.asset_id == DEFAULT_PIG_CUSTOM_ID or asset.is_animated or asset.frame_count > 1
+
+    def _selected_custom_assets_have_animation(self) -> bool:
+        return any(self._custom_asset_is_animated(asset) for asset in self._selected_custom_assets())
+
+    def _sync_custom_animation_controls(self) -> None:
+        enabled = self._selected_custom_assets_have_animation()
+        state = ["!disabled"] if enabled else ["disabled"]
+        for control in self.custom_animation_controls:
+            try:
+                control.state(state)
+            except tk.TclError:
+                pass
+
     def _refresh_custom_panel(self) -> None:
         if self.custom_mode_var.get():
             self.default_settings_section.pack_forget()
@@ -2324,6 +2474,14 @@ class PigPointerApp:
         self._load_selected_custom_asset_to_editor()
         self._sync_custom_status()
 
+    @staticmethod
+    def _custom_asset_detail_text(asset: CustomAssetConfig) -> str:
+        if asset.asset_id == DEFAULT_PIG_CUSTOM_ID or asset.source_width <= 0 or asset.source_height <= 0:
+            return ""
+        kind = "动画" if asset.is_animated else "图片"
+        frame_text = f"，{asset.frame_count}帧" if asset.frame_count > 1 else ""
+        return f"（{kind} {asset.source_width}x{asset.source_height}{frame_text}）"
+
     def _refresh_custom_asset_list(self) -> None:
         self.custom_listbox.delete(0, tk.END)
         selected_index = None
@@ -2334,7 +2492,8 @@ class PigPointerApp:
         for index, asset in enumerate(choices):
             marker = "✓" if asset.enabled else " "
             missing = "" if asset.asset_id == DEFAULT_PIG_CUSTOM_ID or Path(asset.path).exists() else "（文件缺失）"
-            self.custom_listbox.insert(tk.END, f"{index + 1}. [{marker}] {asset.name}{missing}")
+            detail = self._custom_asset_detail_text(asset)
+            self.custom_listbox.insert(tk.END, f"{index + 1}. [{marker}] {asset.name}{detail}{missing}")
             if asset.asset_id in selected_ids:
                 self.custom_listbox.selection_set(index)
             if asset.asset_id == self.custom_selected_id.get():
@@ -2397,7 +2556,7 @@ class PigPointerApp:
             base = f"已添加 {uploaded_total} 个上传资源，启用 {uploaded_active} 个{pig_text}。"
             notes = self._custom_performance_notes(active_assets)
             if notes:
-                base += " 提醒：" + "；".join(notes[:2]) + "。"
+                base += " 提醒：" + "；".join(notes[:3]) + "。"
             self.custom_status_var.set(base)
         self._update_buttons()
 
@@ -2415,26 +2574,82 @@ class PigPointerApp:
         elif total_area >= 150_000:
             notes.append("总显示面积偏大")
 
-        frame_counts = [self._custom_asset_frame_count(asset) for asset in active_assets]
+        frame_counts: list[int] = []
+        total_estimated_pixels = 0
+        large_sources = 0
+        long_gifs = 0
+        heavy_always_animate = 0
+        for asset in active_assets:
+            if asset.asset_id == DEFAULT_PIG_CUSTOM_ID:
+                frame_count = self.renderer.frame_count
+                estimated_pixels = self.renderer.base_size[0] * self.renderer.base_size[1] * max(1, frame_count)
+                source_width, source_height = self.renderer.base_size
+                file_size = _resource_path(GIF_NAME).stat().st_size if _resource_path(GIF_NAME).exists() else 0
+            else:
+                if asset.source_width <= 0 or asset.frame_count <= 0:
+                    self._refresh_custom_asset_stats(asset)
+                frame_count = max(1, asset.frame_count)
+                source_width, source_height = asset.source_width, asset.source_height
+                estimated_pixels = asset.estimated_pixels or source_width * source_height * frame_count
+                file_size = asset.file_size
+            frame_counts.append(frame_count)
+            total_estimated_pixels += estimated_pixels
+            if max(source_width, source_height) >= 1200 or file_size >= 18 * 1024 * 1024:
+                large_sources += 1
+            if frame_count >= 120:
+                long_gifs += 1
+            if asset.always_animate and frame_count >= 50:
+                heavy_always_animate += 1
         total_frames = sum(frame_counts)
         gif_count = sum(1 for count in frame_counts if count > 1)
+        if total_estimated_pixels >= 80_000_000:
+            notes.append("素材帧像素量很高，建议换小一点的动画素材")
+        elif total_estimated_pixels >= 36_000_000:
+            notes.append("素材帧像素量偏高，智能性能更合适")
+        if large_sources:
+            notes.append("有大尺寸或大文件素材，建议先缩小")
+        if long_gifs:
+            notes.append("存在长动画，连续播放会增加缓存压力")
+        if heavy_always_animate >= 2:
+            notes.append("多个长动画连续播放，建议暂停一部分")
         if total_frames >= 180:
-            notes.append("GIF 帧数多，缓存占用会增加")
+            notes.append("动画帧数多，缓存占用会增加")
         elif gif_count >= 4:
-            notes.append("GIF 较多，触发过密会显得卡")
+            notes.append("动画素材较多，触发过密会显得卡")
 
         if self.custom_collision_var.get():
             collision_pairs = active_count * (active_count - 1) // 2
             if collision_pairs >= 45:
-                notes.append("碰撞计算多，可关闭碰撞")
+                notes.append("碰撞对象多，已用分桶优化，关闭仍会更省")
             elif collision_pairs >= 21:
-                notes.append("碰撞对象较多，关闭碰撞会更省")
+                notes.append("碰撞对象较多，分桶会减少无效检查")
         elif active_count >= 2:
             notes.append("资源碰撞已关闭，会更省但可能互相穿过")
 
-        high_probability = sum(1 for asset in active_assets if asset.probability >= 60 and self._custom_asset_frame_count(asset) > 1)
+        high_probability = sum(
+            1
+            for asset, frame_count in zip(active_assets, frame_counts)
+            if asset.probability >= 60 and frame_count > 1
+        )
         if high_probability >= 3:
-            notes.append("多个 GIF 触发概率很高，建议拉开触发间隔")
+            notes.append("多个动画触发概率很高，建议拉开触发间隔")
+        return notes
+
+    @staticmethod
+    def _custom_import_notes(assets: list[CustomAssetConfig]) -> list[str]:
+        notes: list[str] = []
+        heavy_assets = [asset for asset in assets if asset.estimated_pixels >= 40_000_000]
+        long_gifs = [asset for asset in assets if asset.frame_count >= 120]
+        large_files = [asset for asset in assets if asset.file_size >= 18 * 1024 * 1024]
+        large_dimensions = [asset for asset in assets if max(asset.source_width, asset.source_height) >= 1200]
+        if heavy_assets:
+            notes.append(f"{len(heavy_assets)} 个素材帧像素量较高，建议降低尺寸或帧数")
+        if long_gifs:
+            notes.append(f"{len(long_gifs)} 个动画素材帧数较多，连续播放时更吃缓存")
+        if large_files:
+            notes.append(f"{len(large_files)} 个素材文件较大，加载和备份会更慢")
+        if large_dimensions:
+            notes.append(f"{len(large_dimensions)} 个素材源尺寸较大，显示前会有额外缩放开销")
         return notes
 
     def _on_custom_mode_changed(self) -> None:
@@ -2641,12 +2856,15 @@ class PigPointerApp:
             target.size = _clamp(self.custom_item_size_var.get(), 36, 320, 130)
             target.rope_length = _clamp(self.custom_item_rope_length_var.get(), 20, 260, 72)
             target.rope_color = self.custom_item_rope_color_var.get() if self.custom_item_rope_color_var.get() in ROPE_COLORS else "棕色"
-            target.anim_speed = _clamp(self.custom_item_anim_speed_var.get(), 0.2, 4.0, 1.0)
-            target.probability = _clamp(self.custom_item_probability_var.get(), 0, 100, 10)
             target.collision_radius = _clamp(self.custom_item_collision_var.get(), 8, 180, 46)
             target.weight = _clamp(self.custom_item_weight_var.get(), 0, 100, 70)
-            target.reverse_loop = self.custom_item_reverse_loop_var.get()
-            target.always_animate = self.custom_item_always_animate_var.get()
+            if self._custom_asset_is_animated(target):
+                target.anim_speed = _clamp(self.custom_item_anim_speed_var.get(), 0.2, 4.0, 1.0)
+                target.probability = _clamp(self.custom_item_probability_var.get(), 0, 100, 10)
+                target.reverse_loop = self.custom_item_reverse_loop_var.get()
+                target.always_animate = self.custom_item_always_animate_var.get()
+            else:
+                target.always_animate = False
             target.rope_width = _clamp(self.custom_item_rope_width_var.get(), 1, 12, 3)
             old_attach = (target.attach_mode, round(target.attach_x, 2), round(target.attach_y, 2))
             attach_mode = self.custom_item_attach_mode_var.get()
@@ -2751,6 +2969,7 @@ class PigPointerApp:
                 shutil.move(str(source), str(target))
                 asset.path = str(target)
                 self.custom_renderers.pop(asset.asset_id, None)
+                self._refresh_custom_asset_stats(asset)
                 moved += 1
             except Exception:
                 failed += 1
@@ -2781,6 +3000,7 @@ class PigPointerApp:
 
         added = 0
         skipped = 0
+        added_assets: list[CustomAssetConfig] = []
         for raw_path in paths:
             source = Path(raw_path)
             if source.suffix.lower() not in CUSTOM_ASSET_SUFFIXES:
@@ -2796,26 +3016,31 @@ class PigPointerApp:
                 skipped += 1
                 messagebox.showwarning("素材添加失败", f"{source.name}\n{exc}")
                 continue
-            self.custom_renderers[asset_id] = renderer
-            self.custom_assets.append(
-                CustomAssetConfig(
-                    asset_id=asset_id,
-                    name=source.name,
-                    path=str(target),
-                    size=float(self.size_var.get()),
-                    rope_length=float(self.rope_length_var.get()),
-                    probability=float(self.prob_var.get()),
-                    anim_speed=float(self.anim_speed_var.get()),
-                    weight=float(self.weight_var.get()),
-                    rope_width=float(self.rope_width_var.get()),
-                    always_animate=source.suffix.lower() == ".gif",
-                )
+            temp_asset = CustomAssetConfig(
+                asset_id=asset_id,
+                name=source.name,
+                path=str(target),
+                size=float(self.size_var.get()),
+                rope_length=float(self.rope_length_var.get()),
+                probability=float(self.prob_var.get()),
+                anim_speed=float(self.anim_speed_var.get()),
+                weight=float(self.weight_var.get()),
+                rope_width=float(self.rope_width_var.get()),
+                always_animate=False,
             )
+            self._refresh_custom_asset_stats(temp_asset, renderer)
+            temp_asset.always_animate = temp_asset.is_animated
+            self.custom_renderers[asset_id] = renderer
+            self.custom_assets.append(temp_asset)
+            added_assets.append(temp_asset)
             self.custom_selected_id.set(asset_id)
             self.custom_selected_ids = {asset_id}
             added += 1
         if skipped and not added:
             messagebox.showinfo("没有添加素材", "请选择 gif、png、jpg、jpeg、webp 或 bmp 文件。")
+        import_notes = self._custom_import_notes(added_assets)
+        if import_notes:
+            messagebox.showinfo("素材预处理完成", "已完成素材预处理：\n" + "\n".join(f"- {note}" for note in import_notes), parent=self.root)
         self._refresh_custom_panel()
         self._schedule_save_settings()
 
@@ -2968,6 +3193,73 @@ class PigPointerApp:
         for angle in range(-44, 45, max(1, profile.angle_step * 2)):
             self.renderer.render_asset(0, size, angle, profile.angle_step)
 
+    def _custom_asset_frame_count_hint(self, asset: CustomAssetConfig) -> int:
+        if not self._custom_asset_is_animated(asset):
+            return 1
+        if asset.asset_id == DEFAULT_PIG_CUSTOM_ID:
+            return self.renderer.frame_count
+        frame_count = max(1, asset.frame_count)
+        if asset.reverse_loop and frame_count > 2:
+            return frame_count * 2 - 2
+        return frame_count
+
+    def _prepare_custom_prewarm_jobs(self, force: bool = False) -> None:
+        active_assets = self._active_custom_assets()
+        profile = self._current_performance_profile()
+        signature = tuple(
+            (
+                asset.asset_id,
+                int(asset.size),
+                self._custom_asset_frame_count_hint(asset),
+                asset.reverse_loop,
+                asset.attach_mode,
+                round(asset.attach_x, 1),
+                round(asset.attach_y, 1),
+                profile.angle_step,
+            )
+            for asset in active_assets
+            if self._custom_asset_frame_count_hint(asset) > 1
+        )
+        if not force and signature == self.custom_prewarm_signature:
+            return
+        self.custom_prewarm_signature = signature
+        jobs: list[tuple[str, int, int, int]] = []
+        for asset in active_assets:
+            frame_count = self._custom_asset_frame_count_hint(asset)
+            if frame_count <= 1:
+                continue
+            size = int(asset.size)
+            angles = (0, -12, 12)
+            first_frames = list(range(min(frame_count, 12)))
+            sample_step = max(1, frame_count // 12)
+            sampled_frames = list(range(0, frame_count, sample_step))[:12]
+            frames = list(dict.fromkeys(first_frames + sampled_frames))
+            for frame in frames:
+                for angle in angles:
+                    jobs.append((asset.asset_id, frame, size, angle))
+        self.custom_prewarm_jobs = jobs
+
+    def _prewarm_one_custom_asset(self) -> bool:
+        while self.custom_prewarm_jobs:
+            asset_id, frame, size, angle = self.custom_prewarm_jobs.pop(0)
+            asset = next((item for item in self._active_custom_assets() if item.asset_id == asset_id), None)
+            if asset is None:
+                continue
+            rendered = self._render_custom_asset(asset, frame, size, angle, self._current_performance_profile().angle_step)
+            return rendered is not None
+        return False
+
+    def _maybe_prewarm_custom_assets(self, now: float, profile: PerformanceProfile, motion_active: bool) -> None:
+        if not self.custom_mode_var.get() or now - self.last_custom_prewarm_time < 0.025:
+            return
+        self._prepare_custom_prewarm_jobs()
+        if not self.custom_prewarm_jobs:
+            return
+        if self.running and (motion_active or self.average_draw_ms >= 10.0 or self.average_physics_ms >= 6.0):
+            return
+        self._prewarm_one_custom_asset()
+        self.last_custom_prewarm_time = now
+
     def _update_buttons(self) -> None:
         self.start_button.state(["disabled"] if self.running else ["!disabled"])
         self.stop_button.state(["!disabled"] if self.running else ["disabled"])
@@ -2998,6 +3290,7 @@ class PigPointerApp:
 
     def trigger_animation_once(self) -> None:
         if self.custom_mode_var.get():
+            self._prepare_custom_prewarm_jobs(force=True)
             for state in self.custom_states.values():
                 state.animation_active = True
                 state.frame_index = 0
@@ -3015,7 +3308,11 @@ class PigPointerApp:
         profile = self._current_performance_profile()
         self._set_timer_resolution(profile.high_resolution_timer)
         self.running = True
+        self.last_overlay_draw_time = 0.0
+        self.overlay_dirty = True
         self._prewarm_current_static_angles()
+        if self.custom_mode_var.get():
+            self._prepare_custom_prewarm_jobs(force=True)
         self._place_physics_at_cursor()
         if self.overlay is not None:
             self.overlay.show()
@@ -3039,6 +3336,9 @@ class PigPointerApp:
         self.animation_active = False
         self.frame_index = 0
         self.frame_time_ms = 0.0
+        self.last_overlay_draw_time = 0.0
+        self.overlay_dirty = True
+        self.collision_accumulator = 0.0
         self._set_timer_resolution(False)
         self._update_buttons()
 
@@ -3207,6 +3507,7 @@ class PigPointerApp:
 
     def _place_custom_physics_at_cursor(self) -> None:
         self.custom_states.clear()
+        self.collision_accumulator = 0.0
         anchor_x, anchor_y = self._cursor_anchor()
         previous_x, previous_y = anchor_x, anchor_y
         for index, asset in enumerate(self._active_custom_assets()):
@@ -3267,6 +3568,75 @@ class PigPointerApp:
         except Exception:
             pass
 
+    def _animation_signature(self) -> tuple[object, ...]:
+        if self.custom_mode_var.get():
+            signature: list[object] = []
+            for asset in self._active_custom_assets():
+                state = self.custom_states.get(asset.asset_id)
+                if state is None:
+                    signature.append((asset.asset_id, 0, False))
+                else:
+                    signature.append((asset.asset_id, state.frame_index, state.animation_active))
+            return tuple(signature)
+        return (self.frame_index, self.animation_active)
+
+    def _has_active_animation(self) -> bool:
+        if self.custom_mode_var.get():
+            return any(state.animation_active for state in self.custom_states.values())
+        return self.animation_active
+
+    def _physics_activity_score(self, cursor_speed: float) -> float:
+        score = cursor_speed
+        if self.custom_mode_var.get():
+            for state in self.custom_states.values():
+                score = max(score, math.hypot(state.vx, state.vy), abs(state.angular_velocity) * 60.0)
+            return score
+        return max(score, math.hypot(self.rope_vel_x, self.rope_vel_y), abs(self.pig_angular_velocity) * 60.0)
+
+    def _smart_motion_active(self, cursor_speed: float) -> bool:
+        return self._physics_activity_score(cursor_speed) > 8.0
+
+    @staticmethod
+    def _should_draw_overlay(
+        profile: PerformanceProfile,
+        motion_active: bool,
+        animation_changed: bool,
+        overlay_dirty: bool,
+        last_draw_time: float,
+    ) -> bool:
+        if not profile.adaptive:
+            return True
+        return last_draw_time <= 0.0 or overlay_dirty or motion_active or animation_changed
+
+    def _tick_fps(self, profile: PerformanceProfile, motion_active: bool, animation_active: bool) -> int:
+        if not profile.adaptive:
+            return profile.target_fps
+        if motion_active:
+            if self.average_draw_ms >= 20.0:
+                return min(profile.target_fps, 30)
+            if self.average_draw_ms >= 14.0:
+                return min(profile.target_fps, 45)
+            return profile.target_fps
+        if animation_active:
+            return profile.animation_fps
+        return profile.idle_fps
+
+    @staticmethod
+    def _preview_fps(profile: PerformanceProfile) -> int:
+        return 12 if profile.adaptive else 20
+
+    def _record_frame_cost(self, name: str, start_time: float) -> None:
+        elapsed_ms = max(0.0, (time.perf_counter() - start_time) * 1000.0)
+        if name == "draw":
+            self.last_draw_ms = elapsed_ms
+            self.average_draw_ms = elapsed_ms if self.average_draw_ms <= 0 else self.average_draw_ms * 0.85 + elapsed_ms * 0.15
+        elif name == "physics":
+            self.last_physics_ms = elapsed_ms
+            self.average_physics_ms = elapsed_ms if self.average_physics_ms <= 0 else self.average_physics_ms * 0.85 + elapsed_ms * 0.15
+        elif name == "collision":
+            self.last_collision_ms = elapsed_ms
+            self.average_collision_ms = elapsed_ms if self.average_collision_ms <= 0 else self.average_collision_ms * 0.85 + elapsed_ms * 0.15
+
     def _tick(self) -> None:
         now = time.perf_counter()
         profile = self._current_performance_profile()
@@ -3276,18 +3646,32 @@ class PigPointerApp:
 
         if self.tray_icon is not None:
             self.tray_icon.process_pending_actions()
+        animation_before = self._animation_signature()
         self._advance_animation(dt)
+        animation_changed = self._animation_signature() != animation_before
         if not self.running and now - self.last_prewarm_time >= 0.025 and profile.texture_cache_limit > 180:
             self._prewarm_one_asset()
             self.last_prewarm_time = now
-        if now - self.preview_last_time >= 1 / 20:
+        if now - self.preview_last_time >= 1 / self._preview_fps(profile):
             self._draw_preview(now)
             self.preview_last_time = now
+        motion_active = False
+        animation_active = self._has_active_animation()
         if self.running:
-            self._update_physics(dt)
-            self._draw_overlay()
+            physics_start = time.perf_counter()
+            cursor_speed = self._update_physics(dt)
+            self._record_frame_cost("physics", physics_start)
+            motion_active = self._smart_motion_active(cursor_speed) if profile.adaptive else True
+            if self._should_draw_overlay(profile, motion_active, animation_changed, self.overlay_dirty, self.last_overlay_draw_time):
+                draw_start = time.perf_counter()
+                self._draw_overlay()
+                self._record_frame_cost("draw", draw_start)
+                self.last_overlay_draw_time = now
+                self.overlay_dirty = False
+        self._maybe_prewarm_custom_assets(now, profile, motion_active)
 
-        delay = max(1, int(1000 / max(1, profile.target_fps))) if self.running else 12
+        tick_fps = self._tick_fps(profile, motion_active, animation_active)
+        delay = max(1, int(1000 / max(1, tick_fps))) if self.running else 12
         self.root.after(delay, self._tick)
 
     def _advance_animation(self, dt: float) -> None:
@@ -3322,6 +3706,12 @@ class PigPointerApp:
     def _advance_custom_animations(self, dt: float) -> None:
         for asset in self._active_custom_assets():
             state = self.custom_states.setdefault(asset.asset_id, CustomItemState())
+            if not self._custom_asset_is_animated(asset):
+                state.animation_active = False
+                state.frame_index = 0
+                state.frame_time_ms = 0.0
+                state.trigger_timer = 0.0
+                continue
             frame_count = self._custom_asset_frame_count(asset)
             if frame_count <= 1 or (asset.probability <= 0 and not asset.always_animate):
                 state.animation_active = False
@@ -3356,7 +3746,7 @@ class PigPointerApp:
                     state.trigger_timer = 0.0
                     break
 
-    def _update_physics(self, dt: float) -> None:
+    def _update_physics(self, dt: float) -> float:
         if not self.initialized_physics:
             self._place_physics_at_cursor()
 
@@ -3364,11 +3754,12 @@ class PigPointerApp:
         last_x, last_y = self.last_anchor
         cursor_vx = (anchor_x - last_x) / dt
         cursor_vy = (anchor_y - last_y) / dt
+        cursor_speed = math.hypot(cursor_vx, cursor_vy)
         self.last_anchor = (anchor_x, anchor_y)
         self.last_cursor_velocity = (cursor_vx, cursor_vy)
         if self.custom_mode_var.get():
             self._update_custom_physics(dt, anchor_x, anchor_y, cursor_vx, cursor_vy)
-            return
+            return cursor_speed
 
         rope_length = self._rope_length()
         weight = self._weight_factor()
@@ -3423,6 +3814,7 @@ class PigPointerApp:
         self.pig_angular_velocity += (target_angle - self.pig_angle) * rotation_spring * dt
         self.pig_angular_velocity *= max(0.0, 1.0 - rotation_damping * dt)
         self.pig_angle += self.pig_angular_velocity * dt
+        return cursor_speed
 
     def _update_custom_physics(
         self,
@@ -3461,7 +3853,28 @@ class PigPointerApp:
             previous_x, previous_y = state.x, state.y
             previous_vx, previous_vy = state.vx, state.vy
 
-        self._resolve_custom_collisions(active_assets, dt)
+        should_collide, collision_dt = self._custom_collision_step(active_assets, dt)
+        if should_collide:
+            self._resolve_custom_collisions(active_assets, collision_dt)
+
+    def _custom_collision_step(self, active_assets: list[CustomAssetConfig], dt: float) -> tuple[bool, float]:
+        if not self.custom_collision_var.get() or len(active_assets) < 2:
+            self.collision_accumulator = 0.0
+            return False, dt
+        active_count = len(active_assets)
+        profile = self._current_performance_profile()
+        if active_count >= 16:
+            interval = 1 / 20
+        elif active_count >= 9 or profile.adaptive:
+            interval = 1 / 30
+        else:
+            return True, dt
+        self.collision_accumulator += dt
+        if self.collision_accumulator < interval:
+            return False, dt
+        collision_dt = min(self.collision_accumulator, interval * 2.0)
+        self.collision_accumulator = 0.0
+        return True, collision_dt
 
     def _update_custom_item_physics(
         self,
@@ -3540,43 +3953,119 @@ class PigPointerApp:
     def _resolve_custom_collisions(self, active_assets: list[CustomAssetConfig], dt: float) -> None:
         if not self.custom_collision_var.get():
             return
-        for first_index in range(len(active_assets)):
-            first = active_assets[first_index]
-            first_state = self.custom_states.get(first.asset_id)
-            if first_state is None:
+        collision_start = time.perf_counter()
+        indexed_items: list[tuple[int, CustomAssetConfig, CustomItemState]] = []
+        for index, asset in enumerate(active_assets):
+            state = self.custom_states.get(asset.asset_id)
+            if state is not None:
+                indexed_items.append((index, asset, state))
+        for _first_index, first, first_state, _second_index, second, second_state in self._custom_collision_pairs(indexed_items):
+            self._resolve_custom_collision_pair(first, first_state, second, second_state, dt)
+        self._record_frame_cost("collision", collision_start)
+
+    @staticmethod
+    def _custom_collision_pairs(
+        indexed_items: list[tuple[int, CustomAssetConfig, CustomItemState]]
+    ) -> list[tuple[int, CustomAssetConfig, CustomItemState, int, CustomAssetConfig, CustomItemState]]:
+        if len(indexed_items) < 9:
+            return [
+                (*first, *second)
+                for first_offset, first in enumerate(indexed_items)
+                for second in indexed_items[first_offset + 1 :]
+            ]
+
+        max_radius = max((asset.collision_radius for _index, asset, _state in indexed_items), default=24.0)
+        cell_size = max(32.0, max_radius * 2.0)
+        buckets: dict[tuple[int, int], list[tuple[int, CustomAssetConfig, CustomItemState]]] = {}
+        for item in indexed_items:
+            _index, _asset, state = item
+            cell = (math.floor(state.x / cell_size), math.floor(state.y / cell_size))
+            buckets.setdefault(cell, []).append(item)
+
+        pairs: list[tuple[int, CustomAssetConfig, CustomItemState, int, CustomAssetConfig, CustomItemState]] = []
+        seen: set[tuple[int, int]] = set()
+        for (cell_x, cell_y), bucket_items in buckets.items():
+            nearby: list[tuple[int, CustomAssetConfig, CustomItemState]] = []
+            for offset_x in (-1, 0, 1):
+                for offset_y in (-1, 0, 1):
+                    nearby.extend(buckets.get((cell_x + offset_x, cell_y + offset_y), ()))
+            for first in bucket_items:
+                first_index = first[0]
+                for second in nearby:
+                    second_index = second[0]
+                    if second_index <= first_index:
+                        continue
+                    pair_key = (first_index, second_index)
+                    if pair_key in seen:
+                        continue
+                    seen.add(pair_key)
+                    pairs.append((*first, *second))
+        max_pairs = max(36, len(indexed_items) * 5)
+        if len(pairs) > max_pairs:
+            return PigPointerApp._nearest_custom_collision_pairs(pairs, max_neighbors=5)
+        return pairs
+
+    @staticmethod
+    def _nearest_custom_collision_pairs(
+        pairs: list[tuple[int, CustomAssetConfig, CustomItemState, int, CustomAssetConfig, CustomItemState]],
+        max_neighbors: int,
+    ) -> list[tuple[int, CustomAssetConfig, CustomItemState, int, CustomAssetConfig, CustomItemState]]:
+        scored_pairs: list[tuple[float, tuple[int, CustomAssetConfig, CustomItemState, int, CustomAssetConfig, CustomItemState]]] = []
+        for pair in pairs:
+            _first_index, _first, first_state, _second_index, _second, second_state = pair
+            dx = second_state.x - first_state.x
+            dy = second_state.y - first_state.y
+            scored_pairs.append((dx * dx + dy * dy, pair))
+        scored_pairs.sort(key=lambda item: item[0])
+
+        neighbor_counts: dict[int, int] = {}
+        selected: list[tuple[int, CustomAssetConfig, CustomItemState, int, CustomAssetConfig, CustomItemState]] = []
+        for _distance, pair in scored_pairs:
+            first_index = pair[0]
+            second_index = pair[3]
+            if neighbor_counts.get(first_index, 0) >= max_neighbors or neighbor_counts.get(second_index, 0) >= max_neighbors:
                 continue
-            for second in active_assets[first_index + 1 :]:
-                second_state = self.custom_states.get(second.asset_id)
-                if second_state is None:
-                    continue
-                dx = second_state.x - first_state.x
-                dy = second_state.y - first_state.y
-                distance = math.hypot(dx, dy)
-                minimum = max(2.0, first.collision_radius + second.collision_radius)
-                if distance >= minimum:
-                    continue
-                if distance < 0.01:
-                    nx, ny = 1.0, 0.0
-                else:
-                    nx, ny = dx / distance, dy / distance
-                penetration = minimum - distance
-                softness = 0.42
-                push = penetration * softness * 0.5
-                first_state.x -= nx * push
-                first_state.y -= ny * push
-                second_state.x += nx * push
-                second_state.y += ny * push
-                relative_velocity = (second_state.vx - first_state.vx) * nx + (second_state.vy - first_state.vy) * ny
-                if relative_velocity < 0:
-                    impulse = -(1.0 + 0.10) * relative_velocity * 0.5
-                    first_state.vx -= nx * impulse
-                    first_state.vy -= ny * impulse
-                    second_state.vx += nx * impulse
-                    second_state.vy += ny * impulse
-                first_state.vx *= max(0.0, 1.0 - 0.8 * dt)
-                first_state.vy *= max(0.0, 1.0 - 0.8 * dt)
-                second_state.vx *= max(0.0, 1.0 - 0.8 * dt)
-                second_state.vy *= max(0.0, 1.0 - 0.8 * dt)
+            selected.append(pair)
+            neighbor_counts[first_index] = neighbor_counts.get(first_index, 0) + 1
+            neighbor_counts[second_index] = neighbor_counts.get(second_index, 0) + 1
+        return selected
+
+    @staticmethod
+    def _resolve_custom_collision_pair(
+        first: CustomAssetConfig,
+        first_state: CustomItemState,
+        second: CustomAssetConfig,
+        second_state: CustomItemState,
+        dt: float,
+    ) -> None:
+        dx = second_state.x - first_state.x
+        dy = second_state.y - first_state.y
+        distance = math.hypot(dx, dy)
+        minimum = max(2.0, first.collision_radius + second.collision_radius)
+        if distance >= minimum:
+            return
+        if distance < 0.01:
+            nx, ny = 1.0, 0.0
+        else:
+            nx, ny = dx / distance, dy / distance
+        penetration = minimum - distance
+        softness = 0.42
+        push = penetration * softness * 0.5
+        first_state.x -= nx * push
+        first_state.y -= ny * push
+        second_state.x += nx * push
+        second_state.y += ny * push
+        relative_velocity = (second_state.vx - first_state.vx) * nx + (second_state.vy - first_state.vy) * ny
+        if relative_velocity < 0:
+            impulse = -(1.0 + 0.10) * relative_velocity * 0.5
+            first_state.vx -= nx * impulse
+            first_state.vy -= ny * impulse
+            second_state.vx += nx * impulse
+            second_state.vy += ny * impulse
+        first_state.vx *= max(0.0, 1.0 - 0.8 * dt)
+        first_state.vy *= max(0.0, 1.0 - 0.8 * dt)
+        second_state.vx *= max(0.0, 1.0 - 0.8 * dt)
+        second_state.vy *= max(0.0, 1.0 - 0.8 * dt)
 
     def _constrain_rope_to_anchor(self, anchor_x: float, anchor_y: float, rope_length: float) -> None:
         dx = self.rope_end_x - anchor_x
@@ -3592,6 +4081,15 @@ class PigPointerApp:
         radial_velocity = self.rope_vel_x * nx + self.rope_vel_y * ny
         self.rope_vel_x -= radial_velocity * nx
         self.rope_vel_y -= radial_velocity * ny
+
+    def _transparent_composite_canvas(self, width: int, height: int) -> Image.Image:
+        width = max(1, int(width))
+        height = max(1, int(height))
+        if self.composite_canvas is None or self.composite_canvas.size != (width, height):
+            self.composite_canvas = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+        else:
+            self.composite_canvas.paste((0, 0, 0, 0), (0, 0, width, height))
+        return self.composite_canvas
 
     def _draw_overlay(self) -> None:
         if self.overlay is None:
@@ -3644,7 +4142,7 @@ class PigPointerApp:
         canvas_w = max(16, right - left)
         canvas_h = max(16, bottom - top)
 
-        composite = Image.new("RGBA", (canvas_w, canvas_h), (0, 0, 0, 0))
+        composite = self._transparent_composite_canvas(canvas_w, canvas_h)
         draw = ImageDraw.Draw(composite)
         weight = self._weight_factor()
         sag = min(48.0, self._rope_length() * (0.16 + 0.15 * weight) + abs(self.rope_vel_x) * (0.004 + 0.005 * weight))
@@ -3740,7 +4238,7 @@ class PigPointerApp:
         bottom = math.ceil(max(ys) + margin)
         canvas_w = max(16, right - left)
         canvas_h = max(16, bottom - top)
-        composite = Image.new("RGBA", (canvas_w, canvas_h), (0, 0, 0, 0))
+        composite = self._transparent_composite_canvas(canvas_w, canvas_h)
         draw = ImageDraw.Draw(composite)
 
         for item in rendered_items:
@@ -3778,12 +4276,16 @@ class PigPointerApp:
     def _custom_asset_frame_count(self, asset: CustomAssetConfig) -> int:
         if asset.asset_id == DEFAULT_PIG_CUSTOM_ID:
             return self.renderer.frame_count
+        if not self._custom_asset_is_animated(asset):
+            return 1
         renderer = self._custom_renderer(asset)
         return renderer.frame_count(asset.reverse_loop) if renderer is not None else 1
 
     def _custom_asset_duration(self, asset: CustomAssetConfig, frame_index: int) -> int:
         if asset.asset_id == DEFAULT_PIG_CUSTOM_ID:
             return self.renderer.durations[frame_index % self.renderer.frame_count]
+        if not self._custom_asset_is_animated(asset):
+            return 40
         renderer = self._custom_renderer(asset)
         return renderer.duration(frame_index, asset.reverse_loop) if renderer is not None else 40
 
@@ -3846,7 +4348,7 @@ class PigPointerApp:
             cursor_image, cursor_hotspot = cursor_asset
             left = int(math.floor(pointer_x - cursor_hotspot[0] - margin))
             top = int(math.floor(pointer_y - cursor_hotspot[1] - margin))
-            composite = Image.new("RGBA", (cursor_image.width + margin * 2, cursor_image.height + margin * 2), (0, 0, 0, 0))
+            composite = self._transparent_composite_canvas(cursor_image.width + margin * 2, cursor_image.height + margin * 2)
             composite.alpha_composite(cursor_image, (margin, margin))
         else:
             cursor_points = self._cursor_polygon(pointer_x, pointer_y)
@@ -3855,19 +4357,34 @@ class PigPointerApp:
             ys = [point[1] for point in cursor_points + cursor_outline]
             left = int(math.floor(min(xs) - margin))
             top = int(math.floor(min(ys) - margin))
-            composite = Image.new(
-                "RGBA",
-                (int(math.ceil(max(xs) - min(xs) + margin * 2)), int(math.ceil(max(ys) - min(ys) + margin * 2))),
-                (0, 0, 0, 0),
+            composite = self._transparent_composite_canvas(
+                int(math.ceil(max(xs) - min(xs) + margin * 2)),
+                int(math.ceil(max(ys) - min(ys) + margin * 2)),
             )
             draw = ImageDraw.Draw(composite)
             self._draw_cursor_on_pil(draw, cursor_points, cursor_outline, left, top)
         bgra = GifRenderer.to_premultiplied_bgra(composite)
         self.overlay.update_pixels(bgra, composite.width, composite.height, left, top)
 
+    def _custom_renderer_cache_limit(self, asset: CustomAssetConfig) -> int:
+        profile_limit = self._current_performance_profile().texture_cache_limit
+        base = max(32, profile_limit // max(2, len(self.custom_assets) or 2))
+        if not self._custom_asset_is_animated(asset):
+            return base
+        state = self.custom_states.get(asset.asset_id)
+        is_priority = (
+            asset.always_animate
+            or asset.asset_id == self.custom_selected_id.get()
+            or (state is not None and state.animation_active)
+        )
+        if is_priority:
+            return min(profile_limit, max(base * 2, base + 72))
+        return min(profile_limit, max(base + 32, int(base * 1.4)))
+
     def _custom_renderer(self, asset: CustomAssetConfig) -> CustomAssetRenderer | None:
         renderer = self.custom_renderers.get(asset.asset_id)
         if renderer is not None:
+            renderer.cache_limit = self._custom_renderer_cache_limit(asset)
             return renderer
         path = Path(asset.path)
         if not path.exists():
@@ -3876,7 +4393,8 @@ class PigPointerApp:
             renderer = CustomAssetRenderer(path, self.root)
         except Exception:
             return None
-        renderer.cache_limit = max(32, self._current_performance_profile().texture_cache_limit // max(2, len(self.custom_assets) or 2))
+        self._refresh_custom_asset_stats(asset, renderer)
+        renderer.cache_limit = self._custom_renderer_cache_limit(asset)
         self.custom_renderers[asset.asset_id] = renderer
         return renderer
 
