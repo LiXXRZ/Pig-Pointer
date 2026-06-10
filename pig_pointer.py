@@ -18,7 +18,7 @@ from collections import OrderedDict
 from ctypes import wintypes
 from dataclasses import dataclass
 from pathlib import Path
-from tkinter import colorchooser, filedialog, messagebox, ttk
+from tkinter import colorchooser, filedialog, messagebox, simpledialog, ttk
 from typing import Callable
 
 try:
@@ -42,6 +42,7 @@ APP_TITLE = "猪猪指针"
 GIF_NAME = "pig_pointer.gif"
 ICON_NAME = "pig_pointer.ico"
 SETTINGS_FILE_NAME = "settings.json"
+STARTUP_VALUE_NAME = "PigPointer"
 
 WS_EX_LAYERED = 0x00080000
 WS_EX_TRANSPARENT = 0x00000020
@@ -107,6 +108,86 @@ ROPE_COLORS = OrderedDict(
         ("白色", "#f7f4ee"),
         ("蓝色", "#3f7fd8"),
         ("自定义", "#744d2d"),
+    )
+)
+DEFAULT_GLOBAL_SETTINGS = {
+    "size": 150.0,
+    "probability": 15.0,
+    "anchor_x": 24.0,
+    "anchor_y": 30.0,
+    "anim_speed": 1.6,
+    "trigger_interval": 4.0,
+    "weight": 70.0,
+    "rope_length": 72.0,
+    "performance_mode": "普通",
+    "absolute_binding": False,
+    "background": True,
+    "custom_mode": False,
+    "custom_include_pig": False,
+    "custom_connection": CUSTOM_CONNECTION_MOUSE,
+    "custom_collision": True,
+    "custom_pig_rope_color": "棕色",
+    "custom_pig_custom_rope_color": "#744d2d",
+}
+DEFAULT_CUSTOM_ASSET_SETTINGS = {
+    "enabled": True,
+    "size": 130.0,
+    "rope_length": 72.0,
+    "rope_color": "棕色",
+    "custom_rope_color": "#744d2d",
+    "anim_speed": 1.0,
+    "probability": 10.0,
+    "collision_radius": 46.0,
+    "weight": 70.0,
+    "reverse_loop": True,
+}
+CUSTOM_RESOURCE_PRESETS = OrderedDict(
+    (
+        (
+            "重物感",
+            {
+                "size": 150.0,
+                "rope_length": 92.0,
+                "anim_speed": 0.8,
+                "probability": 8.0,
+                "collision_radius": 58.0,
+                "weight": 100.0,
+            },
+        ),
+        (
+            "气球感",
+            {
+                "size": 126.0,
+                "rope_length": 118.0,
+                "anim_speed": 0.9,
+                "probability": 5.0,
+                "collision_radius": 44.0,
+                "weight": 0.0,
+            },
+        ),
+        (
+            "拖尾串串",
+            {
+                "size": 122.0,
+                "rope_length": 110.0,
+                "anim_speed": 1.1,
+                "probability": 14.0,
+                "collision_radius": 42.0,
+                "weight": 72.0,
+                "connection": CUSTOM_CONNECTION_CHAIN,
+            },
+        ),
+        (
+            "轻快摆动",
+            {
+                "size": 118.0,
+                "rope_length": 64.0,
+                "anim_speed": 1.8,
+                "probability": 24.0,
+                "collision_radius": 40.0,
+                "weight": 42.0,
+            },
+        ),
     )
 )
 
@@ -279,6 +360,45 @@ def _default_assets_dir() -> Path:
     return _settings_path().parent / CUSTOM_ASSETS_DIR_NAME
 
 
+def _startup_command() -> str:
+    if getattr(sys, "frozen", False):
+        return f'"{Path(sys.executable).resolve()}"'
+    return f'"{Path(sys.executable).resolve()}" "{Path(__file__).resolve()}"'
+
+
+def _is_startup_enabled() -> bool:
+    if sys.platform != "win32":
+        return False
+    try:
+        import winreg
+
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Run") as key:
+            value, _value_type = winreg.QueryValueEx(key, STARTUP_VALUE_NAME)
+        return bool(value)
+    except Exception:
+        return False
+
+
+def _set_startup_enabled(enabled: bool) -> None:
+    if sys.platform != "win32":
+        raise RuntimeError("开机启动只支持 Windows。")
+    import winreg
+
+    with winreg.CreateKeyEx(
+        winreg.HKEY_CURRENT_USER,
+        r"Software\Microsoft\Windows\CurrentVersion\Run",
+        0,
+        access=winreg.KEY_SET_VALUE,
+    ) as key:
+        if enabled:
+            winreg.SetValueEx(key, STARTUP_VALUE_NAME, 0, winreg.REG_SZ, _startup_command())
+        else:
+            try:
+                winreg.DeleteValue(key, STARTUP_VALUE_NAME)
+            except FileNotFoundError:
+                pass
+
+
 def _clamp(value: object, minimum: float, maximum: float, default: float) -> float:
     try:
         number = float(value)
@@ -296,6 +416,18 @@ def _is_hex_color(value: str) -> bool:
 def _safe_asset_name(name: str) -> str:
     cleaned = "".join(char if char not in '<>:"/\\|?*' else "_" for char in name).strip()
     return cleaned or "asset"
+
+
+def _unique_asset_path(directory: Path, filename: str) -> Path:
+    source_name = Path(filename)
+    safe_stem = _safe_asset_name(source_name.stem)
+    suffix = source_name.suffix.lower()
+    candidate = directory / f"{safe_stem}{suffix}"
+    index = 2
+    while candidate.exists():
+        candidate = directory / f"{safe_stem}_{index}{suffix}"
+        index += 1
+    return candidate
 
 
 def _load_settings_file() -> dict[str, object]:
@@ -1328,24 +1460,27 @@ class PigPointerApp:
         self.cursor_guard = CursorVisibilityGuard()
         self.absolute_cursor_asset: tuple[Image.Image, tuple[float, float]] | None = None
 
-        self.size_var = tk.DoubleVar(value=self._setting_float("size", 150, 70, 260))
-        self.prob_var = tk.DoubleVar(value=self._setting_float("probability", 15, 0, 100))
-        self.anchor_x_var = tk.DoubleVar(value=self._setting_float("anchor_x", 24, -30, 80))
-        self.anchor_y_var = tk.DoubleVar(value=self._setting_float("anchor_y", 30, -20, 90))
-        self.anim_speed_var = tk.DoubleVar(value=self._setting_float("anim_speed", 1.6, 0.5, 3.0))
-        self.trigger_interval_var = tk.DoubleVar(value=self._setting_float("trigger_interval", 4.0, 1.0, 20.0))
-        self.weight_var = tk.DoubleVar(value=self._setting_float("weight", 70, 0, 100))
-        self.rope_length_var = tk.DoubleVar(value=self._setting_float("rope_length", 72, 36, 160))
-        self.performance_mode_var = tk.StringVar(value=self._setting_mode("performance_mode", "普通"))
-        self.absolute_binding_var = tk.BooleanVar(value=self._setting_bool("absolute_binding", False))
-        self.background_var = tk.BooleanVar(value=self._setting_bool("background", True))
-        self.custom_mode_var = tk.BooleanVar(value=self._setting_bool("custom_mode", False))
-        self.custom_include_pig_var = tk.BooleanVar(value=self._setting_bool("custom_include_pig", False))
-        self.custom_connection_var = tk.StringVar(value=self._setting_connection_mode("custom_connection", CUSTOM_CONNECTION_MOUSE))
+        self.size_var = tk.DoubleVar(value=self._setting_float("size", DEFAULT_GLOBAL_SETTINGS["size"], 70, 260))
+        self.prob_var = tk.DoubleVar(value=self._setting_float("probability", DEFAULT_GLOBAL_SETTINGS["probability"], 0, 100))
+        self.anchor_x_var = tk.DoubleVar(value=self._setting_float("anchor_x", DEFAULT_GLOBAL_SETTINGS["anchor_x"], -30, 80))
+        self.anchor_y_var = tk.DoubleVar(value=self._setting_float("anchor_y", DEFAULT_GLOBAL_SETTINGS["anchor_y"], -20, 90))
+        self.anim_speed_var = tk.DoubleVar(value=self._setting_float("anim_speed", DEFAULT_GLOBAL_SETTINGS["anim_speed"], 0.5, 3.0))
+        self.trigger_interval_var = tk.DoubleVar(value=self._setting_float("trigger_interval", DEFAULT_GLOBAL_SETTINGS["trigger_interval"], 1.0, 20.0))
+        self.weight_var = tk.DoubleVar(value=self._setting_float("weight", DEFAULT_GLOBAL_SETTINGS["weight"], 0, 100))
+        self.rope_length_var = tk.DoubleVar(value=self._setting_float("rope_length", DEFAULT_GLOBAL_SETTINGS["rope_length"], 36, 160))
+        self.performance_mode_var = tk.StringVar(value=self._setting_mode("performance_mode", DEFAULT_GLOBAL_SETTINGS["performance_mode"]))
+        self.absolute_binding_var = tk.BooleanVar(value=self._setting_bool("absolute_binding", DEFAULT_GLOBAL_SETTINGS["absolute_binding"]))
+        self.background_var = tk.BooleanVar(value=self._setting_bool("background", DEFAULT_GLOBAL_SETTINGS["background"]))
+        self.start_with_windows_var = tk.BooleanVar(value=_is_startup_enabled())
+        self.custom_mode_var = tk.BooleanVar(value=self._setting_bool("custom_mode", DEFAULT_GLOBAL_SETTINGS["custom_mode"]))
+        self.custom_include_pig_var = tk.BooleanVar(value=self._setting_bool("custom_include_pig", DEFAULT_GLOBAL_SETTINGS["custom_include_pig"]))
+        self.custom_connection_var = tk.StringVar(value=self._setting_connection_mode("custom_connection", DEFAULT_GLOBAL_SETTINGS["custom_connection"]))
+        self.custom_collision_var = tk.BooleanVar(value=self._setting_bool("custom_collision", DEFAULT_GLOBAL_SETTINGS["custom_collision"]))
+        self.custom_preset_var = tk.StringVar(value=next(iter(CUSTOM_RESOURCE_PRESETS)))
         self.custom_assets_dir_var = tk.StringVar(value=self._setting_assets_dir("custom_assets_dir"))
-        self.custom_pig_rope_color_var = tk.StringVar(value=self._setting_rope_color("custom_pig_rope_color", "棕色"))
+        self.custom_pig_rope_color_var = tk.StringVar(value=self._setting_rope_color("custom_pig_rope_color", DEFAULT_GLOBAL_SETTINGS["custom_pig_rope_color"]))
         self.custom_pig_custom_rope_color_var = tk.StringVar(
-            value=self._setting_hex_color("custom_pig_custom_rope_color", "#744d2d")
+            value=self._setting_hex_color("custom_pig_custom_rope_color", DEFAULT_GLOBAL_SETTINGS["custom_pig_custom_rope_color"])
         )
         self.status_var = tk.StringVar(value="准备就绪")
         self.custom_assets_dir_text = tk.StringVar()
@@ -1367,6 +1502,8 @@ class PigPointerApp:
         self.custom_item_probability_text = tk.StringVar()
         self.custom_item_collision_text = tk.StringVar()
         self.custom_item_weight_text = tk.StringVar()
+        self.custom_color_swatch: tk.Canvas | None = None
+        self.custom_color_swatch_rect: int | None = None
         self.size_text = tk.StringVar()
         self.prob_text = tk.StringVar()
         self.anchor_x_text = tk.StringVar()
@@ -1485,6 +1622,13 @@ class PigPointerApp:
 
         ttk.Checkbutton(
             outer,
+            text="开机自动启动",
+            variable=self.start_with_windows_var,
+            command=self._on_startup_changed,
+        ).pack(anchor="w", pady=(0, 14))
+
+        ttk.Checkbutton(
+            outer,
             text="绝对绑定模式（隐藏系统鼠标并自绘鼠标）",
             variable=self.absolute_binding_var,
             command=self._on_absolute_binding_changed,
@@ -1503,6 +1647,8 @@ class PigPointerApp:
                 variable=self.performance_mode_var,
                 command=self._on_performance_mode_changed,
             ).pack(side="left", padx=(8, 0))
+
+        ttk.Button(outer, text="恢复默认设置", command=self._reset_default_settings).pack(fill="x", pady=(0, 12))
 
         self.preview = tk.Canvas(
             outer,
@@ -1621,23 +1767,58 @@ class PigPointerApp:
             command=self._on_custom_include_pig_changed,
         ).pack(anchor="w", pady=(0, 8))
 
+        batch_row = ttk.Frame(parent)
+        batch_row.pack(fill="x", pady=(0, 8))
+        ttk.Button(batch_row, text="全部启用", command=self._enable_all_custom_assets).pack(
+            side="left", expand=True, fill="x", padx=(0, 4)
+        )
+        ttk.Button(batch_row, text="全部暂停", command=self._pause_all_custom_assets).pack(
+            side="left", expand=True, fill="x", padx=4
+        )
+        ttk.Button(batch_row, text="清空上传资源", command=self._clear_uploaded_custom_assets).pack(
+            side="left", expand=True, fill="x", padx=(4, 0)
+        )
+
         self.custom_listbox = tk.Listbox(parent, height=4, exportselection=False, activestyle="dotbox")
         self.custom_listbox.pack(fill="x", pady=(0, 8))
         self.custom_listbox.bind("<<ListboxSelect>>", self._on_custom_selection_changed)
 
         action_row = ttk.Frame(parent)
         action_row.pack(fill="x", pady=(0, 8))
-        ttk.Button(action_row, text="删除选中", command=self._delete_selected_custom_asset).pack(side="left")
+        ttk.Button(action_row, text="重命名", command=self._rename_selected_custom_asset).pack(
+            side="left", expand=True, fill="x", padx=(0, 3)
+        )
+        ttk.Button(action_row, text="上移", command=lambda: self._move_selected_custom_asset(-1)).pack(
+            side="left", expand=True, fill="x", padx=3
+        )
+        ttk.Button(action_row, text="下移", command=lambda: self._move_selected_custom_asset(1)).pack(
+            side="left", expand=True, fill="x", padx=3
+        )
+        ttk.Button(action_row, text="删除", command=self._delete_selected_custom_asset).pack(
+            side="left", expand=True, fill="x", padx=(3, 0)
+        )
+        enable_row = ttk.Frame(parent)
+        enable_row.pack(fill="x", pady=(0, 8))
         ttk.Checkbutton(
-            action_row,
+            enable_row,
             text="启用选中",
             variable=self.custom_item_enabled_var,
             command=self._on_custom_item_setting_changed,
-        ).pack(side="right")
+        ).pack(anchor="w")
 
         self.custom_editor = ttk.Frame(parent)
         self.custom_editor.pack(fill="x")
         ttk.Label(self.custom_editor, textvariable=self.custom_item_name_var, foreground="#5b4636").pack(anchor="w")
+        preset_row = ttk.Frame(self.custom_editor)
+        preset_row.pack(fill="x", pady=(8, 0))
+        ttk.Label(preset_row, text="资源预设").pack(side="left")
+        ttk.Button(preset_row, text="应用", command=self._apply_custom_preset).pack(side="right")
+        ttk.OptionMenu(
+            preset_row,
+            self.custom_preset_var,
+            self.custom_preset_var.get(),
+            *CUSTOM_RESOURCE_PRESETS.keys(),
+        ).pack(side="right", padx=(0, 8))
         self._add_custom_slider(
             self.custom_editor,
             "显示大小",
@@ -1657,6 +1838,15 @@ class PigPointerApp:
         color_row = ttk.Frame(self.custom_editor)
         color_row.pack(fill="x", pady=(8, 0))
         ttk.Label(color_row, text="绳子颜色").pack(side="left")
+        self.custom_color_swatch = tk.Canvas(
+            color_row,
+            width=24,
+            height=16,
+            highlightthickness=1,
+            highlightbackground="#b8aca2",
+        )
+        self.custom_color_swatch_rect = self.custom_color_swatch.create_rectangle(0, 0, 24, 16, outline="")
+        self.custom_color_swatch.pack(side="right", padx=(8, 0))
         ttk.OptionMenu(
             color_row,
             self.custom_item_rope_color_var,
@@ -1711,6 +1901,12 @@ class PigPointerApp:
         self.custom_global_section = ttk.Frame(parent)
         self.custom_global_section.pack(fill="x", pady=(10, 0))
         ttk.Label(self.custom_global_section, text="全局设置", foreground="#5b4636").pack(anchor="w")
+        ttk.Checkbutton(
+            self.custom_global_section,
+            text="资源相互碰撞",
+            variable=self.custom_collision_var,
+            command=self._on_custom_collision_changed,
+        ).pack(anchor="w", pady=(8, 0))
         self._add_custom_slider(
             self.custom_global_section,
             "触发间隔",
@@ -1825,11 +2021,13 @@ class PigPointerApp:
             "performance_mode": self.performance_mode_var.get(),
             "absolute_binding": self.absolute_binding_var.get(),
             "background": self.background_var.get(),
+            "start_with_windows": self.start_with_windows_var.get(),
             "custom_mode": self.custom_mode_var.get(),
             "custom_include_pig": self.custom_include_pig_var.get(),
             "custom_pig_rope_color": self.custom_pig_rope_color_var.get(),
             "custom_pig_custom_rope_color": self.custom_pig_custom_rope_color_var.get(),
             "custom_connection": self.custom_connection_var.get(),
+            "custom_collision": self.custom_collision_var.get(),
             "custom_assets_dir": self.custom_assets_dir_var.get(),
             "custom_assets": [asset.to_dict() for asset in self.custom_assets],
         }
@@ -1867,12 +2065,29 @@ class PigPointerApp:
             self.custom_color_button.state(["!disabled"] if color_is_custom else ["disabled"])
         except AttributeError:
             pass
+        self._sync_custom_color_swatch()
 
     def _sync_custom_assets_dir_text(self) -> None:
         path = self.custom_assets_dir_var.get()
         if len(path) > 34:
             path = "..." + path[-31:]
         self.custom_assets_dir_text.set(path)
+
+    def _custom_rope_hex(self, rope_color: str, custom_color: str) -> str:
+        color = custom_color if rope_color == "自定义" else ROPE_COLORS.get(rope_color, "#744d2d")
+        return color if _is_hex_color(color) else "#744d2d"
+
+    def _sync_custom_color_swatch(self) -> None:
+        if self.custom_color_swatch is None or self.custom_color_swatch_rect is None:
+            return
+        asset = self._selected_custom_asset()
+        custom_color = "#744d2d"
+        if asset is not None:
+            custom_color = asset.custom_rope_color
+        if asset is not None and asset.asset_id == DEFAULT_PIG_CUSTOM_ID:
+            custom_color = self.custom_pig_custom_rope_color_var.get()
+        color = self._custom_rope_hex(self.custom_item_rope_color_var.get(), custom_color)
+        self.custom_color_swatch.itemconfigure(self.custom_color_swatch_rect, fill=color)
 
     def _default_pig_custom_asset(self) -> CustomAssetConfig:
         return CustomAssetConfig(
@@ -1934,7 +2149,7 @@ class PigPointerApp:
         for index, asset in enumerate(choices):
             marker = "✓" if asset.enabled else " "
             missing = "" if asset.asset_id == DEFAULT_PIG_CUSTOM_ID or Path(asset.path).exists() else "（文件缺失）"
-            self.custom_listbox.insert(tk.END, f"[{marker}] {asset.name}{missing}")
+            self.custom_listbox.insert(tk.END, f"{index + 1}. [{marker}] {asset.name}{missing}")
             if asset.asset_id == self.custom_selected_id.get():
                 selected_index = index
         if selected_index is None and choices:
@@ -1967,7 +2182,8 @@ class PigPointerApp:
             self._sync_custom_editor_labels()
 
     def _sync_custom_status(self) -> None:
-        active_count = len(self._active_custom_assets())
+        active_assets = self._active_custom_assets()
+        active_count = len(active_assets)
         uploaded_total = len(self.custom_assets)
         uploaded_active = len(self._uploaded_custom_assets())
         pig_text = "，猪猪参与" if self.custom_include_pig_var.get() else ""
@@ -1975,11 +2191,49 @@ class PigPointerApp:
             self.custom_status_var.set("")
         elif active_count == 0:
             self.custom_status_var.set("自定义模式开启后，默认猪猪不会显示；请添加图片/GIF，或勾选“猪猪也参与”。")
-        elif active_count > 8:
-            self.custom_status_var.set(f"已启用 {active_count} 个资源{pig_text}；数量不限制，但太多可能影响流畅度。")
         else:
-            self.custom_status_var.set(f"已添加 {uploaded_total} 个上传资源，启用 {uploaded_active} 个{pig_text}。")
+            base = f"已添加 {uploaded_total} 个上传资源，启用 {uploaded_active} 个{pig_text}。"
+            notes = self._custom_performance_notes(active_assets)
+            if notes:
+                base += " 提醒：" + "；".join(notes[:2]) + "。"
+            self.custom_status_var.set(base)
         self._update_buttons()
+
+    def _custom_performance_notes(self, active_assets: list[CustomAssetConfig]) -> list[str]:
+        notes: list[str] = []
+        active_count = len(active_assets)
+        if active_count >= 12:
+            notes.append("资源数量很多，建议暂停一部分或切到低性能")
+        elif active_count >= 7:
+            notes.append("资源数量偏多，透明绘制压力会上升")
+
+        total_area = sum(asset.size * asset.size for asset in active_assets)
+        if total_area >= 260_000:
+            notes.append("总显示面积很大，缩小部分资源会更稳")
+        elif total_area >= 150_000:
+            notes.append("总显示面积偏大")
+
+        frame_counts = [self._custom_asset_frame_count(asset) for asset in active_assets]
+        total_frames = sum(frame_counts)
+        gif_count = sum(1 for count in frame_counts if count > 1)
+        if total_frames >= 180:
+            notes.append(f"GIF 总帧数约 {total_frames} 帧，动画缓存会更吃内存")
+        elif gif_count >= 4:
+            notes.append(f"同时启用 {gif_count} 个 GIF，动画触发过密会显得卡")
+
+        if self.custom_collision_var.get():
+            collision_pairs = active_count * (active_count - 1) // 2
+            if collision_pairs >= 45:
+                notes.append(f"碰撞计算约 {collision_pairs} 组，可关闭资源相互碰撞")
+            elif collision_pairs >= 21:
+                notes.append("碰撞对象较多，关闭碰撞会更省")
+        elif active_count >= 2:
+            notes.append("资源碰撞已关闭，会更省但可能互相穿过")
+
+        high_probability = sum(1 for asset in active_assets if asset.probability >= 60 and self._custom_asset_frame_count(asset) > 1)
+        if high_probability >= 3:
+            notes.append("多个 GIF 触发概率很高，建议拉开触发间隔")
+        return notes
 
     def _on_custom_mode_changed(self) -> None:
         if self.custom_mode_var.get() and self.running:
@@ -2000,6 +2254,11 @@ class PigPointerApp:
     def _on_custom_connection_changed(self) -> None:
         if self.running:
             self._place_custom_physics_at_cursor()
+        self._sync_custom_status()
+        self._schedule_save_settings()
+
+    def _on_custom_collision_changed(self) -> None:
+        self._sync_custom_status()
         self._schedule_save_settings()
 
     def _on_custom_selection_changed(self, _event: tk.Event | None = None) -> None:
@@ -2011,6 +2270,112 @@ class PigPointerApp:
         if 0 <= index < len(choices):
             self.custom_selected_id.set(choices[index].asset_id)
             self._load_selected_custom_asset_to_editor()
+
+    def _uploaded_custom_asset_index(self, asset_id: str) -> int | None:
+        for index, asset in enumerate(self.custom_assets):
+            if asset.asset_id == asset_id:
+                return index
+        return None
+
+    def _rename_selected_custom_asset(self) -> None:
+        asset = self._selected_custom_asset()
+        if asset is None:
+            return
+        if asset.asset_id == DEFAULT_PIG_CUSTOM_ID:
+            messagebox.showinfo("不能重命名", "默认猪猪的名称是固定的。")
+            return
+        new_name = simpledialog.askstring(
+            "重命名资源",
+            "输入新的资源名称：",
+            initialvalue=asset.name,
+            parent=self.root,
+        )
+        if new_name is None:
+            return
+        new_name = new_name.strip()
+        if not new_name:
+            messagebox.showinfo("名称为空", "资源名称不能为空。")
+            return
+        asset.name = new_name
+        self._refresh_custom_panel()
+        self._schedule_save_settings()
+
+    def _move_selected_custom_asset(self, direction: int) -> None:
+        asset = self._selected_custom_asset()
+        if asset is None or asset.asset_id == DEFAULT_PIG_CUSTOM_ID:
+            return
+        index = self._uploaded_custom_asset_index(asset.asset_id)
+        if index is None:
+            return
+        new_index = index + direction
+        if new_index < 0 or new_index >= len(self.custom_assets):
+            return
+        self.custom_assets[index], self.custom_assets[new_index] = self.custom_assets[new_index], self.custom_assets[index]
+        self.custom_selected_id.set(asset.asset_id)
+        if self.running:
+            self._place_custom_physics_at_cursor()
+        self._refresh_custom_panel()
+        self._schedule_save_settings()
+
+    def _enable_all_custom_assets(self) -> None:
+        if not self.custom_assets:
+            messagebox.showinfo("没有上传资源", "还没有添加图片或 GIF。")
+            return
+        for asset in self.custom_assets:
+            asset.enabled = True
+        if self.running:
+            self._place_custom_physics_at_cursor()
+        self._refresh_custom_panel()
+        self._schedule_save_settings()
+
+    def _pause_all_custom_assets(self) -> None:
+        for asset in self.custom_assets:
+            asset.enabled = False
+        self.custom_include_pig_var.set(False)
+        self.custom_selected_id.set(self.custom_assets[0].asset_id if self.custom_assets else "")
+        if self.running:
+            self.custom_states.clear()
+        self._refresh_custom_panel()
+        self._schedule_save_settings()
+
+    def _clear_uploaded_custom_assets(self) -> None:
+        if not self.custom_assets:
+            messagebox.showinfo("没有上传资源", "当前列表里没有上传资源。")
+            return
+        confirmed = messagebox.askyesno(
+            "清空上传资源",
+            "这会从列表中移除所有上传资源，但不会删除磁盘上的原文件或已复制文件。继续吗？",
+            parent=self.root,
+        )
+        if not confirmed:
+            return
+        uploaded_ids = {asset.asset_id for asset in self.custom_assets}
+        self.custom_assets = []
+        for asset_id in uploaded_ids:
+            self.custom_renderers.pop(asset_id, None)
+            self.custom_states.pop(asset_id, None)
+        self.custom_selected_id.set(DEFAULT_PIG_CUSTOM_ID if self.custom_include_pig_var.get() else "")
+        self._refresh_custom_panel()
+        self._schedule_save_settings()
+
+    def _apply_custom_preset(self) -> None:
+        asset = self._selected_custom_asset()
+        if asset is None:
+            return
+        preset = CUSTOM_RESOURCE_PRESETS.get(self.custom_preset_var.get())
+        if preset is None:
+            return
+        self.custom_item_size_var.set(float(preset["size"]))
+        self.custom_item_rope_length_var.set(float(preset["rope_length"]))
+        self.custom_item_anim_speed_var.set(float(preset["anim_speed"]))
+        self.custom_item_probability_var.set(float(preset["probability"]))
+        self.custom_item_collision_var.set(float(preset["collision_radius"]))
+        self.custom_item_weight_var.set(float(preset["weight"]))
+        connection = preset.get("connection")
+        if isinstance(connection, str) and connection in CUSTOM_CONNECTION_MODES:
+            self.custom_connection_var.set(connection)
+            self._on_custom_connection_changed()
+        self._on_custom_item_setting_changed()
 
     def _on_custom_item_setting_changed(self) -> None:
         if self.custom_syncing_ui:
@@ -2073,9 +2438,77 @@ class PigPointerApp:
         directory = filedialog.askdirectory(parent=self.root, title="选择自定义素材保存位置", initialdir=initialdir)
         if not directory:
             return
-        self.custom_assets_dir_var.set(directory)
+        target_dir = Path(directory).expanduser()
+        try:
+            same_dir = current.expanduser().resolve() == target_dir.resolve()
+        except Exception:
+            same_dir = str(current) == str(target_dir)
+        if same_dir:
+            self.custom_assets_dir_var.set(str(target_dir))
+            self._sync_custom_assets_dir_text()
+            self._schedule_save_settings()
+            return
+        migrate_assets = False
+        if self.custom_assets:
+            answer = messagebox.askyesnocancel(
+                "迁移保存目录",
+                "要把当前列表里的已复制素材移动到新保存位置吗？\n\n选择“否”只会让之后新增的素材保存到新位置。",
+                parent=self.root,
+            )
+            if answer is None:
+                return
+            migrate_assets = bool(answer)
+        if migrate_assets:
+            if not self._migrate_custom_assets_dir(target_dir):
+                return
+        else:
+            try:
+                target_dir.mkdir(parents=True, exist_ok=True)
+            except Exception as exc:
+                messagebox.showerror("无法创建保存位置", f"请换一个保存位置：\n{exc}", parent=self.root)
+                return
+        self.custom_assets_dir_var.set(str(target_dir))
         self._sync_custom_assets_dir_text()
+        self._refresh_custom_panel()
         self._schedule_save_settings()
+
+    def _migrate_custom_assets_dir(self, target_dir: Path) -> bool:
+        try:
+            target_dir.mkdir(parents=True, exist_ok=True)
+        except Exception as exc:
+            messagebox.showerror("无法创建保存位置", f"请换一个保存位置：\n{exc}", parent=self.root)
+            return False
+        moved = 0
+        missing = 0
+        failed = 0
+        try:
+            target_resolved = target_dir.resolve()
+        except Exception:
+            target_resolved = target_dir
+        for asset in self.custom_assets:
+            source = Path(asset.path).expanduser()
+            if not source.exists():
+                missing += 1
+                continue
+            try:
+                if source.resolve().parent == target_resolved:
+                    continue
+                target = _unique_asset_path(target_dir, source.name)
+                shutil.move(str(source), str(target))
+                asset.path = str(target)
+                self.custom_renderers.pop(asset.asset_id, None)
+                moved += 1
+            except Exception:
+                failed += 1
+        if self.running:
+            self._place_custom_physics_at_cursor()
+        if missing or failed:
+            messagebox.showwarning(
+                "目录迁移完成",
+                f"已迁移 {moved} 个资源；缺失 {missing} 个，失败 {failed} 个。缺失或失败的资源仍保留原路径。",
+                parent=self.root,
+            )
+        return True
 
     def _add_custom_assets(self) -> None:
         filetypes = (
@@ -2151,9 +2584,7 @@ class PigPointerApp:
         self._schedule_save_settings()
 
     def _custom_rope_rgba(self, config: CustomAssetConfig) -> tuple[int, int, int, int]:
-        color = config.custom_rope_color if config.rope_color == "自定义" else ROPE_COLORS.get(config.rope_color, "#744d2d")
-        if not _is_hex_color(color):
-            color = "#744d2d"
+        color = self._custom_rope_hex(config.rope_color, config.custom_rope_color)
         return (int(color[1:3], 16), int(color[3:5], 16), int(color[5:7], 16), 245)
 
     def _current_performance_profile(self) -> PerformanceProfile:
@@ -2163,6 +2594,74 @@ class PigPointerApp:
         self._sync_slider_labels()
         profile = self._current_performance_profile()
         self._set_timer_resolution(self.running and profile.high_resolution_timer)
+        self._schedule_save_settings()
+
+    def _on_startup_changed(self) -> None:
+        enabled = self.start_with_windows_var.get()
+        try:
+            _set_startup_enabled(enabled)
+        except Exception as exc:
+            self.start_with_windows_var.set(_is_startup_enabled())
+            messagebox.showerror("开机启动设置失败", f"无法修改开机启动：\n{exc}", parent=self.root)
+            return
+        self._schedule_save_settings()
+
+    def _reset_default_settings(self) -> None:
+        confirmed = messagebox.askyesno(
+            "恢复默认设置",
+            "会恢复显示、物理、性能、自定义开关和资源参数；已上传的资源列表与保存目录会保留。继续吗？",
+            parent=self.root,
+        )
+        if not confirmed:
+            return
+        self.size_var.set(DEFAULT_GLOBAL_SETTINGS["size"])
+        self.prob_var.set(DEFAULT_GLOBAL_SETTINGS["probability"])
+        self.anchor_x_var.set(DEFAULT_GLOBAL_SETTINGS["anchor_x"])
+        self.anchor_y_var.set(DEFAULT_GLOBAL_SETTINGS["anchor_y"])
+        self.anim_speed_var.set(DEFAULT_GLOBAL_SETTINGS["anim_speed"])
+        self.trigger_interval_var.set(DEFAULT_GLOBAL_SETTINGS["trigger_interval"])
+        self.weight_var.set(DEFAULT_GLOBAL_SETTINGS["weight"])
+        self.rope_length_var.set(DEFAULT_GLOBAL_SETTINGS["rope_length"])
+        self.performance_mode_var.set(DEFAULT_GLOBAL_SETTINGS["performance_mode"])
+        self.absolute_binding_var.set(DEFAULT_GLOBAL_SETTINGS["absolute_binding"])
+        self.background_var.set(DEFAULT_GLOBAL_SETTINGS["background"])
+        self.custom_mode_var.set(DEFAULT_GLOBAL_SETTINGS["custom_mode"])
+        self.custom_include_pig_var.set(DEFAULT_GLOBAL_SETTINGS["custom_include_pig"])
+        self.custom_connection_var.set(DEFAULT_GLOBAL_SETTINGS["custom_connection"])
+        self.custom_collision_var.set(DEFAULT_GLOBAL_SETTINGS["custom_collision"])
+        self.custom_pig_rope_color_var.set(DEFAULT_GLOBAL_SETTINGS["custom_pig_rope_color"])
+        self.custom_pig_custom_rope_color_var.set(DEFAULT_GLOBAL_SETTINGS["custom_pig_custom_rope_color"])
+        if self.start_with_windows_var.get():
+            try:
+                _set_startup_enabled(False)
+            except Exception as exc:
+                messagebox.showwarning("开机启动未关闭", f"无法关闭开机启动：\n{exc}", parent=self.root)
+        self.start_with_windows_var.set(_is_startup_enabled())
+
+        for asset in self.custom_assets:
+            asset.enabled = bool(DEFAULT_CUSTOM_ASSET_SETTINGS["enabled"])
+            asset.size = float(DEFAULT_CUSTOM_ASSET_SETTINGS["size"])
+            asset.rope_length = float(DEFAULT_CUSTOM_ASSET_SETTINGS["rope_length"])
+            asset.rope_color = str(DEFAULT_CUSTOM_ASSET_SETTINGS["rope_color"])
+            asset.custom_rope_color = str(DEFAULT_CUSTOM_ASSET_SETTINGS["custom_rope_color"])
+            asset.anim_speed = float(DEFAULT_CUSTOM_ASSET_SETTINGS["anim_speed"])
+            asset.probability = float(DEFAULT_CUSTOM_ASSET_SETTINGS["probability"])
+            asset.collision_radius = float(DEFAULT_CUSTOM_ASSET_SETTINGS["collision_radius"])
+            asset.weight = float(DEFAULT_CUSTOM_ASSET_SETTINGS["weight"])
+            asset.reverse_loop = bool(DEFAULT_CUSTOM_ASSET_SETTINGS["reverse_loop"])
+
+        self.custom_selected_id.set(self.custom_assets[0].asset_id if self.custom_assets else "")
+        self.animation_active = False
+        self.frame_index = 0
+        self.frame_time_ms = 0.0
+        self.custom_states.clear()
+        self.cursor_guard.show()
+        self.absolute_cursor_asset = None
+        self._set_timer_resolution(self.running and self._current_performance_profile().high_resolution_timer)
+        if self.running:
+            self._place_physics_at_cursor()
+        self._sync_slider_labels()
+        self._refresh_custom_panel()
         self._schedule_save_settings()
 
     def _on_absolute_binding_changed(self) -> None:
@@ -2756,6 +3255,8 @@ class PigPointerApp:
         state.vy -= radial_velocity * ny
 
     def _resolve_custom_collisions(self, active_assets: list[CustomAssetConfig], dt: float) -> None:
+        if not self.custom_collision_var.get():
+            return
         for first_index in range(len(active_assets)):
             first = active_assets[first_index]
             first_state = self.custom_states.get(first.asset_id)
