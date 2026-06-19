@@ -2146,13 +2146,17 @@ class PigPointerApp:
         return last_draw_time <= 0.0 or overlay_dirty or motion_active or animation_changed
 
     def _tick_fps(self, profile: PerformanceProfile, motion_active: bool, animation_active: bool) -> int:
+        # Always throttle based on real draw cost, even in non-adaptive modes.
+        # This handles heavy DWM compositing (e.g. video wallpaper) gracefully.
+        if self.average_draw_ms >= 30.0:
+            return 20
+        if self.average_draw_ms >= 20.0:
+            return 30
+        if self.average_draw_ms >= 14.0:
+            return 45
         if not profile.adaptive:
             return profile.target_fps
         if motion_active:
-            if self.average_draw_ms >= 20.0:
-                return min(profile.target_fps, 30)
-            if self.average_draw_ms >= 14.0:
-                return min(profile.target_fps, 45)
             return profile.target_fps
         if animation_active:
             return profile.animation_fps
