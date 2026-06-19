@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Thin wrapper — delegates to the pig_pointer package for backward compatibility."""
+"""Entry point for `python -m pig_pointer`."""
 
 from pig_pointer.app import main
 

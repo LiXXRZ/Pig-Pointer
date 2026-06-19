@@ -27,10 +27,17 @@ pip install -r requirements.txt
 python pig_pointer.py
 ```
 
-也可以双击：
+也可以双击启动脚本（会自动检查依赖）：
 
 ```text
-start_pig_pointer.bat
+start_pig_pointer.bat    # Windows CMD
+run.ps1                  # PowerShell (管理员可选)
+```
+
+或用模块方式运行：
+
+```powershell
+python -m pig_pointer
 ```
 
 ## 使用注意
@@ -141,13 +148,23 @@ dist\PigPointer.exe
 
 ```text
 .
-├─ pig_pointer.py          主程序
-├─ pig_pointer.gif         默认小猪动画
-├─ pig_pointer.ico         软件图标
-├─ start_pig_pointer.bat   源码运行启动脚本
-├─ build.ps1               PyInstaller 打包脚本
-├─ requirements.txt        运行依赖
-└─ requirements-dev.txt    打包依赖
+├─ pig_pointer.py             兼容入口 (委托到 pig_pointer 包)
+├─ pig_pointer/               主程序包
+│  ├─ __init__.py             包标记
+│  ├─ __main__.py             python -m 入口
+│  ├─ constants.py            常量和配置数据
+│  ├─ utils.py                通用工具函数
+│  ├─ win32.py                Windows API 封装 (透明层, 鼠标捕获)
+│  ├─ renderers.py            渲染器 (GIF, 自定义素材)
+│  ├─ tray.py                 系统托盘
+│  └─ app.py                  主应用逻辑
+├─ pig_pointer.gif            默认小猪动画
+├─ pig_pointer.ico            软件图标
+├─ start_pig_pointer.bat      Windows CMD 启动脚本
+├─ run.ps1                    PowerShell 启动脚本
+├─ build.ps1                  PyInstaller 打包脚本
+├─ requirements.txt           运行依赖
+└─ requirements-dev.txt       打包依赖
 ```
 
 `dist/PigPointer.exe` 是本地打包产物，不纳入源码仓库；正式下载请使用 GitHub Release。
